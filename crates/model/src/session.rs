@@ -216,6 +216,11 @@ pub struct EditState {
     pub midi_merge: bool,
     pub record_mode: String,
     pub loop_record: bool,
+    /// A record-enabled audio track plays its input (while stopped and while recording). Off:
+    /// only the track's own Input Monitoring does, for an interface that monitors directly (no
+    /// doubled, delayed signal). Instrument tracks still hear the keyboard when armed.
+    #[serde(default = "yes")]
+    pub auto_input_monitoring: bool,
     pub quickpunch: bool,
     pub scrolling: String,
     pub solo_mode: String,
@@ -293,6 +298,7 @@ impl Default for EditState {
             midi_merge: false,
             record_mode: "normal".into(),
             loop_record: false,
+            auto_input_monitoring: true,
             quickpunch: false,
             scrolling: "page".into(),
             solo_mode: "sip".into(),
@@ -377,11 +383,66 @@ pub struct Session {
     /// Performance). Independent of undo so a restore survives later edits.
     #[serde(default)]
     pub midi_originals: std::collections::BTreeMap<u64, soundcraft_midi::Sequence>,
+    /// Stored console states (Mix › Scenes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scenes: Vec<crate::MixScene>,
+    /// The groove Groove quantize pulls notes to (extracted from a clip).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groove: Option<Groove>,
     #[serde(skip)]
     pub pool: SourcePool,
     /// The folder relative source paths point into: where the session was opened or last saved.
     #[serde(skip)]
     pub folder: Option<std::path::PathBuf>,
+}
+
+/// A quantize groove: note positions (and velocities) inside one cycle, repeated end to end.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Groove {
+    /// Where it came from (the clip's name).
+    pub name: String,
+    /// One cycle, in ticks (whole bars).
+    pub length: i64,
+    /// (tick inside the cycle, velocity 1..=127), ascending.
+    pub points: Vec<(i64, u8)>,
+}
+
+/// Most points a groove keeps.
+pub const MAX_GROOVE_POINTS: usize = 4096;
+
+impl Groove {
+    /// A groove from note or hit positions (ticks from the start of the cycle's first bar).
+    /// Positions fold into `length`, hits closer than 10 ticks merge (keeping the louder), and
+    /// velocities clamp to 1..=127. `None` without a positive length or any position.
+    pub fn from_positions(name: &str, length: i64, positions: impl IntoIterator<Item = (i64, u8)>) -> Option<Groove> {
+        if length <= 0 {
+            return None;
+        }
+        let mut pts: Vec<(i64, u8)> =
+            positions.into_iter().take(MAX_GROOVE_POINTS * 4).map(|(t, v)| (t.rem_euclid(length), v.clamp(1, 127))).collect();
+        pts.sort_unstable();
+        let mut out: Vec<(i64, u8)> = Vec::new();
+        for (t, v) in pts {
+            match out.last_mut() {
+                Some(last) if t - last.0 < 10 => last.1 = last.1.max(v),
+                _ => out.push((t, v)),
+            }
+        }
+        out.truncate(MAX_GROOVE_POINTS);
+        (!out.is_empty()).then(|| Groove { name: name.to_string(), length, points: out })
+    }
+
+    /// Clamp into range after loading: a positive length, points inside it, sane velocities.
+    pub fn sanitize(&mut self) {
+        self.length = self.length.clamp(1, 1 << 30);
+        let len = self.length;
+        self.points.truncate(MAX_GROOVE_POINTS);
+        for p in &mut self.points {
+            p.0 = p.0.rem_euclid(len);
+            p.1 = p.1.clamp(1, 127);
+        }
+        self.points.sort_unstable();
+    }
 }
 
 impl Default for Session {
@@ -415,6 +476,8 @@ impl Session {
             next_id: 1,
             comments: String::new(),
             midi_originals: std::collections::BTreeMap::new(),
+            scenes: Vec::new(),
+            groove: None,
             pool: SourcePool::default(),
             folder: None,
         };
@@ -683,7 +746,7 @@ impl Session {
             return b.id;
         }
         let id = BusId(self.alloc());
-        self.busses.push(Bus { id, name: name.to_string(), format });
+        self.busses.push(Bus { id, name: name.to_string(), format, cue: None });
         id
     }
 
@@ -812,6 +875,9 @@ impl Session {
             truncate_chars(key, MAX_NAME_CHARS);
         }
         self.midi_originals.values_mut().for_each(bound_sequence);
+        if let Some(g) = &mut self.groove {
+            g.sanitize();
+        }
         let e = &mut self.edit;
         for at in [
             &mut e.selection.start,
@@ -852,6 +918,8 @@ impl Session {
             self.sample_rate = SampleRate::default();
         }
         self.tempo.sanitize();
+        self.scenes.truncate(crate::MAX_SCENES);
+        self.scenes.iter_mut().for_each(crate::MixScene::sanitize);
     }
 
     /// Reject a document whose ids are ambiguous or exhausted, run after [`Session::sanitize`] on

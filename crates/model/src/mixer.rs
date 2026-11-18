@@ -397,6 +397,20 @@ pub struct Bus {
     pub id: BusId,
     pub name: String,
     pub format: ChannelFormat,
+    /// Set when the bus is a cue mix: a separate headphone or monitor mix that every channel
+    /// sends to, played out of its own aux channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue: Option<CueMix>,
+}
+
+/// A cue mix's settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CueMix {
+    /// The sends follow the main mix: each channel feeds the cue after its fader and with its
+    /// pan, and the send level becomes an offset from the main mix. Off, the sends are a mix of
+    /// their own, before the fader.
+    #[serde(default)]
+    pub follow_main: bool,
 }
 
 /// Physical output paths (from the I/O setup).
@@ -572,6 +586,25 @@ impl Mixer {
             sp.sanitize();
         }
         self.trim_db = finite_or(self.trim_db, 0.0).clamp(-144.0, 24.0);
+    }
+}
+
+/// Most scenes a session keeps; older ones must be deleted before storing more.
+pub const MAX_SCENES: usize = 64;
+
+/// A stored console state ("scene"): every track's mixer settings at the moment it was stored,
+/// keyed by track id. Recall applies chosen parts of it back to the tracks that still exist.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MixScene {
+    pub name: String,
+    #[serde(default)]
+    pub tracks: Vec<(u64, Mixer)>,
+}
+
+impl MixScene {
+    pub fn sanitize(&mut self) {
+        crate::truncate_chars(&mut self.name, crate::MAX_NAME_CHARS);
+        self.tracks.iter_mut().for_each(|(_, m)| m.sanitize());
     }
 }
 

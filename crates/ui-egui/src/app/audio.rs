@@ -29,6 +29,8 @@ impl SoundApp {
         let player = soundcraft_playback::Player::with_config(self.engine.session_arc(), &self.ui.audio);
         player.locate(at);
         self.player = Some(player);
+        // The new player opens the keyboards afresh.
+        self.midi_key = None;
         Ok(())
     }
 
@@ -37,7 +39,8 @@ impl SoundApp {
         if self.recorder.is_some() || self.recorder_failed || self.player.is_none() {
             return;
         }
-        match soundcraft_playback::record::Recorder::open_with(&self.ui.audio) {
+        let Some(player) = &self.player else { return };
+        match player.open_recorder(&self.ui.audio) {
             Ok(r) => {
                 if let Some(p) = &self.player {
                     p.set_input(std::sync::Arc::clone(&r.monitor));
@@ -122,12 +125,22 @@ impl SoundApp {
         self.recorder = None;
         self.recorder_failed = false;
         self.player = Some(Player::with_config(self.engine.session_arc(), &self.ui.audio));
+        self.midi_key = None;
     }
 }
 
-pub(super) fn feed_meter(d: &mut MeterDisplay, peak: [f32; 2], gr: f32, dt: f32) {
+pub(super) fn feed_meter(d: &mut MeterDisplay, peak: [f32; 2], rms: [f32; 2], gr: f32, dt: f32) {
     // Instant attack, ~26 dB/s release, 2 s peak hold.
     let fall = 10f32.powf(-26.0 * dt / 20.0);
+    // RMS: about 300 ms of averaging both ways, so it reads as loudness rather than transients.
+    let k = 1.0 - (-dt.max(0.0) / 0.3).exp();
+    for (r, v) in d.rms.iter_mut().zip(rms) {
+        let v = if v.is_finite() { v } else { 0.0 };
+        *r += (v - *r) * k;
+        if *r < 1e-5 {
+            *r = 0.0;
+        }
+    }
     for c in 0..2 {
         let v = peak.get(c).copied().unwrap_or(0.0);
         let lvl = d.level.get(c).copied().unwrap_or(0.0);

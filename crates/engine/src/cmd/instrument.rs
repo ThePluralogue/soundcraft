@@ -5,7 +5,7 @@ use super::{CommandSpec, bad, has_selection, str_param, tracks_required};
 
 use crate::{Engine, Result, cmd};
 use serde_json::{Value, json};
-use soundcraft_model::{Insert, TrackKind};
+use soundcraft_model::TrackKind;
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -60,10 +60,7 @@ fn set_instrument(e: &mut Engine, p: &Value) -> Result<Value> {
             values.push((k.clone(), pi.clamp(x as f32)));
         }
     }
-    let mut ins = Insert::new(info.id);
-    for pi in info.params {
-        ins.params.insert(pi.id.to_string(), pi.default);
-    }
+    let mut ins = super::mix::new_insert(info);
     for (k, v) in values {
         ins.params.insert(k, v);
     }

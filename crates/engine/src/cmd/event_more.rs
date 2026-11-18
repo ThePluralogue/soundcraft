@@ -149,7 +149,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Retrospective Record",
             ["Event"],
             None,
-            "{track?, notes?: [{pitch, start?: position | start_ticks?, length_ticks?: 240, velocity?: 100}]} — turns captured MIDI into a clip (input quantize applies)",
+            "{track?, notes?: [{pitch, start?: position | start_ticks?, length_ticks?: 240, velocity?: 100}], range?: {start, end} (samples), new_playlist?: false} — turns captured MIDI into a clip (input quantize applies). With `range` (a loop pass or punch) the clip spans it and keeps only notes starting in it, cut at its end; `new_playlist` puts the clip on a new playlist (a loop pass after the first)",
             always,
             retro_record
         ),
@@ -753,6 +753,21 @@ fn retro_record(e: &mut Engine, p: &Value) -> Result<Value> {
     let t = midi_target(e, p, id)?;
     let s = e.session();
     let sr = s.sample_rate;
+    // `(start, end)` in ticks and in samples.
+    let range = match p.get("range") {
+        None | Some(Value::Null) => None,
+        Some(r) => {
+            let (Some(a), Some(b)) = (r.get("start").and_then(Value::as_i64), r.get("end").and_then(Value::as_i64)) else {
+                return Err(bad(id, "`range` needs `start` and `end` in samples"));
+            };
+            let (a, b) = (a.clamp(0, MAX_POSITION), b.clamp(0, MAX_POSITION));
+            if b <= a {
+                return Err(bad(id, "`range` is empty"));
+            }
+            Some((s.tempo.samples_to_ticks(a, sr), s.tempo.samples_to_ticks(b, sr), a, b))
+        }
+    };
+    let new_playlist = p.get("new_playlist").and_then(Value::as_bool).unwrap_or(false);
     // Latest start tick whose longest note still ends within MAX_POSITION.
     let max_tick = s.tempo.samples_to_ticks(MAX_POSITION, sr).saturating_sub(TICKS_PER_QUARTER * 1024).max(0);
     let mut raw: Vec<(i64, Note)> = Vec::new();
@@ -763,7 +778,12 @@ fn retro_record(e: &mut Engine, p: &Value) -> Result<Value> {
             _ => return Err(bad(id, "each note needs `start` or `start_ticks`")),
         }
         .min(max_tick);
-        let note = Note {
+        if let Some((ta, tb, ..)) = range
+            && (tick < ta || tick >= tb)
+        {
+            continue;
+        }
+        let mut note = Note {
             pitch: i64_or(v, "pitch", 60).clamp(0, 127) as u8,
             velocity: i64_or(v, "velocity", 100).clamp(1, 127) as u8,
             release_velocity: 64,
@@ -771,12 +791,24 @@ fn retro_record(e: &mut Engine, p: &Value) -> Result<Value> {
             start: 0,
             length: i64_or(v, "length_ticks", TICKS_PER_QUARTER / 4).clamp(1, TICKS_PER_QUARTER * 1024),
         };
+        if let Some((_, tb, ..)) = range {
+            note.length = note.length.min(tb - tick).max(1);
+        }
         raw.push((tick, note));
     }
+    if raw.is_empty() {
+        return Ok(json!({"recorded": 0}));
+    }
     let first = raw.iter().map(|x| x.0).min().unwrap_or(0);
-    // Start the clip on the bar line so the quantize grid lines up with the music.
-    let clip_tick = s.tempo.bar_start_tick(s.tempo.bar_beat_at_tick(first).bar).min(first).max(0);
-    let end_tick = raw.iter().map(|(tk, n)| tk.saturating_add(n.length)).max().unwrap_or_else(|| first.saturating_add(1));
+    // Start the clip on the bar line so the quantize grid lines up with the music; a range
+    // (loop pass or punch) is the clip.
+    let (clip_tick, end_tick) = match range {
+        Some((ta, tb, ..)) => (ta, tb),
+        None => (
+            s.tempo.bar_start_tick(s.tempo.bar_beat_at_tick(first).bar).min(first).max(0),
+            raw.iter().map(|(tk, n)| tk.saturating_add(n.length)).max().unwrap_or_else(|| first.saturating_add(1)),
+        ),
+    };
     let mut seq = soundcraft_midi::Sequence::default();
     for (tk, mut n) in raw {
         n.start = tk - clip_tick;
@@ -789,10 +821,18 @@ fn retro_record(e: &mut Engine, p: &Value) -> Result<Value> {
         soundcraft_midi::ops::quantize(&mut seq.notes, &quantize_opts(s));
         seq.sort();
     }
-    let start = s.tempo.tick_to_samples(clip_tick, sr);
-    let end = s.tempo.tick_to_samples(end_tick, sr).min(MAX_POSITION);
+    let (start, end) = match range {
+        Some((.., a, b)) => (a, b),
+        None => (s.tempo.tick_to_samples(clip_tick, sr), s.tempo.tick_to_samples(end_tick, sr).min(MAX_POSITION)),
+    };
     let n = seq.notes.len();
     let s = e.session_mut();
+    if new_playlist && let Some(tr) = s.track_mut(t) {
+        // Like a loop pass of audio: each pass after the first on a playlist of its own.
+        let name = format!("{}.{:02}", tr.name, tr.playlists.len() + 1);
+        tr.playlists.push(soundcraft_model::Playlist::new(name));
+        tr.active_playlist = tr.playlists.len() - 1;
+    }
     let cid = s.new_clip_id();
     let name = s.track(t).map(|x| x.name.clone()).unwrap_or_default();
     crate::edit::place_clip(s, t, Clip::midi(cid, name, start, (end - start).max(1), seq));
@@ -828,6 +868,37 @@ mod tests {
         }
         assert_eq!(chord_name(&w, 7).as_deref(), Some("G7"));
         assert_eq!(chord_name(&[0.0; 12], 0), None);
+    }
+
+    #[test]
+    fn a_loop_pass_spans_its_range_and_later_passes_get_their_own_playlist() {
+        let (mut e, t) = midi_engine();
+        let sr = e.session().sample_rate;
+        let q = e.session().tempo.tick_to_samples(TICKS_PER_QUARTER, sr);
+        // A one-bar loop from beat 2: a note before it, one in it held past its end, one after.
+        let range = json!({"start": q, "end": 5 * q});
+        let notes = json!([
+            {"pitch": 50, "start_ticks": 0},
+            {"pitch": 60, "start_ticks": 2 * TICKS_PER_QUARTER, "length_ticks": 8 * TICKS_PER_QUARTER},
+            {"pitch": 70, "start_ticks": 6 * TICKS_PER_QUARTER},
+        ]);
+        let playlists = |e: &Engine| e.session().track(t).map_or(0, |x| x.playlists.len());
+        let before = playlists(&e);
+        let r = e.execute("event.retrospective_record", &json!({"track": t.0, "notes": notes, "range": range})).unwrap();
+        assert_eq!(r["recorded"], 1, "only the note starting in the range");
+        let clip = e.session().track(t).unwrap().playlist().unwrap().clips.iter().find(|c| c.id.0 == r["clip"].as_u64().unwrap()).cloned().unwrap();
+        assert_eq!((clip.start, clip.length), (q, 4 * q), "the clip is the range");
+        let ClipContent::Midi { sequence: seq } = &clip.content else { panic!("a MIDI clip") };
+        assert_eq!((seq.notes[0].start, seq.notes[0].length), (TICKS_PER_QUARTER, 3 * TICKS_PER_QUARTER), "cut at the range end");
+        assert_eq!(playlists(&e), before);
+        let r = e.execute("event.retrospective_record", &json!({"track": t.0, "notes": notes, "range": range, "new_playlist": true})).unwrap();
+        assert_eq!(r["recorded"], 1);
+        let tr = e.session().track(t).unwrap();
+        assert_eq!((tr.playlists.len(), tr.active_playlist), (before + 1, before), "the next pass is on a new, active playlist");
+        assert_eq!(
+            e.execute("event.retrospective_record", &json!({"track": t.0, "notes": [{"pitch": 1, "start_ticks": 0}], "range": range})).unwrap()["recorded"],
+            0
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::audio::feed_meter;
+use super::midi_keys;
 use super::plugins::failed_plugin_status;
 use super::{Gesture, MainWindow, MeterDisplay, Range, Samples, SoundApp, TrackId, TransportRequest, json};
 
@@ -66,7 +67,8 @@ impl SoundApp {
             let s = self.engine.session();
             (s.edit.insertion_follows_playback, s.edit.scrolling == "after_playback")
         };
-        if follow_insertion {
+        // A range selection is also the loop and punch range: stopping keeps it.
+        if follow_insertion && self.engine.session().edit.selection.is_empty() {
             let pos = self.engine.transport.position;
             self.engine.session_mut().edit.selection = Range::point(pos);
         }
@@ -100,14 +102,25 @@ impl SoundApp {
             self.record_hint = Some((self.last_frame.unwrap_or_default(), why));
             return;
         }
-        self.ensure_input();
-        let takes = match self.arm_recorder() {
-            Ok(takes) => takes,
-            Err(err) => {
-                self.ui.status = format!("Cannot record: {err}");
-                return;
+        // Audio tracks record from the input; instrument tracks from the keyboards. A pass may
+        // be either or both.
+        let s = self.engine.session();
+        let audio_armed = s.tracks.iter().any(|t| t.mixer.record_arm && t.kind == soundcraft_model::TrackKind::Audio);
+        let midi_armed = !midi_keys::midi_armed(s).is_empty();
+        let takes = if audio_armed || !midi_armed {
+            self.ensure_input();
+            match self.arm_recorder() {
+                Ok(takes) => takes,
+                Err(err) => {
+                    self.ui.status = format!("Cannot record: {err}");
+                    return;
+                }
             }
+        } else {
+            Vec::new()
         };
+        self.record_audio = !takes.is_empty();
+        self.played_midi.clear();
         self.lost_shown = 0;
         if let Some(p) = &self.player {
             p.set_recording(true);
@@ -203,6 +216,13 @@ impl SoundApp {
             p.set_recording(false);
         }
         let plan = self.take_plan.take();
+        let midi_clips = self.place_played_midi(plan.as_ref().and_then(|p| p.pass), self.punch);
+        let midi_note = if midi_clips > 0 { format!(", {midi_clips} MIDI clip(s)") } else { String::new() };
+        if !std::mem::take(&mut self.record_audio) {
+            self.punch = None;
+            self.ui.status = if midi_clips > 0 { format!("Recorded {midi_clips} MIDI clip(s)") } else { "Nothing played on the keyboard".into() };
+            return;
+        }
         let Some(r) = &mut self.recorder else { return };
         let (takes, problem) = r.finish();
         let tracks = takes.len().max(1);
@@ -216,8 +236,11 @@ impl SoundApp {
         self.punch = None;
         self.autosaved_rev = 0;
         let ids = soundcraft_engine::io::place_recording(&mut self.engine, &plan, takes);
-        self.ui.status =
-            if plan.pass.is_some() { format!("Loop-recorded {} take(s)", ids.len() / tracks) } else { format!("Recorded {} clip(s)", ids.len()) };
+        self.ui.status = if plan.pass.is_some() {
+            format!("Loop-recorded {} take(s){midi_note}", ids.len() / tracks)
+        } else {
+            format!("Recorded {} clip(s){midi_note}", ids.len())
+        };
         if let Some(p) = problem {
             log::warn!("recording: {p}");
             self.ui.status = format!("{} ({p})", self.ui.status);
@@ -439,7 +462,7 @@ impl SoundApp {
             let snap = &self.meter_snapshot;
             for (id, m) in &snap.tracks {
                 let d = self.meters.entry(*id).or_default();
-                feed_meter(d, m.peak, m.gain_reduction_db, dt);
+                feed_meter(d, m.peak, m.rms, m.gain_reduction_db, dt);
                 if m.plugin_failures.count != d.plugin_failures {
                     d.plugin_failures = m.plugin_failures.count;
                     if let Some(msg) = failed_plugin_status(self.engine.session(), *id, m.plugin_failures.last) {
@@ -447,8 +470,8 @@ impl SoundApp {
                     }
                 }
             }
-            let main = snap.main.peak;
-            feed_meter(&mut self.main_meter, main, 0.0, dt);
+            let (main, main_rms) = (snap.main.peak, snap.main.rms);
+            feed_meter(&mut self.main_meter, main, main_rms, 0.0, dt);
             if ended {
                 self.stop_play();
             }
@@ -468,9 +491,9 @@ impl SoundApp {
         }
         if !self.meters_live() {
             for d in self.meters.values_mut() {
-                feed_meter(d, [0.0, 0.0], 0.0, dt);
+                feed_meter(d, [0.0, 0.0], [0.0, 0.0], 0.0, dt);
             }
-            feed_meter(&mut self.main_meter, [0.0, 0.0], 0.0, dt);
+            feed_meter(&mut self.main_meter, [0.0, 0.0], [0.0, 0.0], 0.0, dt);
         }
     }
 }

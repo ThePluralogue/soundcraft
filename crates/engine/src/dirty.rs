@@ -33,13 +33,15 @@ fn document_values<'a>(s: &'a Session, navigation: &'a EditState) -> impl Partia
         next_id,
         comments,
         midi_originals,
+        scenes,
+        groove,
         pool,
         folder,
     } = s;
     // Tuples implement PartialEq up to twelve elements. These contain only borrowed fields.
     (
         (format_version, name, sample_rate, bit_depth, frame_rate, timecode_start, tempo, key_signatures, sources, videos, busses),
-        (outputs, markers, groups, auto_names, edit_values(edit, navigation), next_id, comments, midi_originals, pool, folder),
+        (outputs, markers, groups, auto_names, edit_values(edit, navigation), next_id, comments, midi_originals, scenes, groove, pool, folder),
     )
 }
 
@@ -136,6 +138,7 @@ fn edit_values<'a>(edit: &'a EditState, navigation: &'a EditState) -> impl Parti
         midi_merge,
         record_mode,
         loop_record,
+        auto_input_monitoring,
         quickpunch,
         scrolling,
         solo_mode,
@@ -186,7 +189,7 @@ fn edit_values<'a>(edit: &'a EditState, navigation: &'a EditState) -> impl Parti
             countoff_bars,
             midi_merge,
             record_mode,
-            loop_record,
+            (loop_record, auto_input_monitoring),
             quickpunch,
             scrolling,
             solo_mode,
@@ -287,6 +290,7 @@ mod tests {
             ("midi_merge", |e| e.midi_merge = !e.midi_merge),
             ("record_mode", |e| e.record_mode = "destructive".into()),
             ("loop_record", |e| e.loop_record = !e.loop_record),
+            ("auto_input_monitoring", |e| e.auto_input_monitoring = !e.auto_input_monitoring),
             ("quickpunch", |e| e.quickpunch = !e.quickpunch),
             ("scrolling", |e| e.scrolling = "continuous".into()),
             ("solo_mode", |e| e.solo_mode = "afl".into()),

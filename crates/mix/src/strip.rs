@@ -41,6 +41,8 @@ pub(crate) struct Strip {
     pub(crate) sample: Option<Arc<SourceAudio>>,
     /// MIDI notes currently sounding on the instrument (pitch), for note-offs at stops/seek.
     pub(crate) held: Vec<u8>,
+    /// Keys held down on a live keyboard (MIDI input) that the instrument is sounding.
+    pub(crate) live_held: Vec<u8>,
     /// The instrument's next block starts somewhere new: send it the controllers in effect there.
     pub(crate) chase: bool,
     pub(crate) muted: bool,
@@ -140,6 +142,7 @@ impl Strip {
             instrument: None,
             sample: None,
             held: Vec::new(),
+            live_held: Vec::with_capacity(128),
             chase: true,
             muted: false,
             gr: 0.0,
@@ -207,6 +210,8 @@ pub(crate) struct LiveInput<'a> {
     pub(crate) input: &'a [Vec<f32>],
     pub(crate) monitor_only: bool,
     pub(crate) recording: bool,
+    /// This block's messages from live keyboards (MIDI input).
+    pub(crate) midi: &'a [crate::LiveMidi],
 }
 
 /// The block being rendered: where it starts, its length, and whether any track is soloed.
@@ -295,7 +300,7 @@ fn read_aux_bus(t: &Track, strip: &mut Strip, busses: &HashMap<BusId, BusBuf>, f
 }
 
 /// Render the track's instrument into the strip.
-fn render_instrument(s: &Session, t: &Track, strip: &mut Strip, blk: Block, transport: &Transport) {
+fn render_instrument(s: &Session, t: &Track, strip: &mut Strip, blk: Block, transport: &Transport, clips: bool, live: Option<&[crate::LiveMidi]>) {
     let Block { pos, frames, .. } = blk;
     if let Some(inst) = strip.instrument.as_mut().filter(|i| !i.failed) {
         // #152: push the instrument's stored parameter values into the live plugin
@@ -310,7 +315,17 @@ fn render_instrument(s: &Session, t: &Track, strip: &mut Strip, blk: Block, tran
         if std::mem::take(&mut strip.chase) {
             chase_controllers(s, t, pos, inst);
         }
-        schedule_notes(s, t, pos, frames, inst, &mut strip.held);
+        if clips {
+            schedule_notes(s, t, pos, frames, inst, &mut strip.held);
+        }
+        match live {
+            Some(events) => {
+                for ev in events {
+                    play_live(inst, &mut strip.live_held, ev.msg);
+                }
+            }
+            None => release_held(inst, &mut strip.live_held),
+        }
         if strip.buf.len() >= 2 {
             inst.plugin.process(&mut strip.buf, frames);
         } else if let Some(c0) = strip.buf.first_mut() {
@@ -327,6 +342,41 @@ fn render_instrument(s: &Session, t: &Track, strip: &mut Strip, blk: Block, tran
         if contain_failure(inst, &mut strip.buf, frames) {
             strip.failures.record(INSTRUMENT_SLOT);
         }
+    }
+}
+
+/// One live keyboard message for the instrument, at the start of the block. Notes and
+/// controllers go to MIDI channel 1, where clip notes go.
+fn play_live(inst: &mut PluginSlot, held: &mut Vec<u8>, msg: [u8; 3]) {
+    let (status, a, b) = (msg[0] & 0xF0, msg[1] & 0x7F, msg[2] & 0x7F);
+    match status {
+        0x90 if b > 0 => {
+            inst.plugin.note_on(0, a, b);
+            if !held.contains(&a) && held.len() < 128 {
+                held.push(a);
+            }
+        }
+        0x80 | 0x90 => {
+            inst.plugin.note_off(0, a);
+            held.retain(|k| *k != a);
+        }
+        0xA0 | 0xB0 | 0xD0 | 0xE0 => inst.plugin.midi(0, [status, a, b]),
+        0xC0 => inst.plugin.midi(0, [status, a, 0]),
+        _ => {}
+    }
+}
+
+/// Lets go of every live key the instrument still holds (the track stopped hearing the keyboard).
+fn release_held(inst: &mut PluginSlot, held: &mut Vec<u8>) {
+    for k in held.drain(..) {
+        inst.plugin.note_off(0, k);
+    }
+}
+
+/// [`release_held`] for a strip whose instrument is not rendered this block.
+fn release_live(strip: &mut Strip) {
+    if let Some(inst) = strip.instrument.as_mut() {
+        release_held(inst, &mut strip.live_held);
     }
 }
 
@@ -406,14 +456,27 @@ pub(crate) fn process_strip(s: &Session, t: &Track, strip: &mut Strip, busses: &
     zero_buf(&mut strip.buf, frames);
     let transport = transport_at(s, pos, !live.monitor_only, live.recording);
     match t.kind {
-        TrackKind::Audio if !live.input.is_empty() && (t.mixer.input_monitor || (t.mixer.record_arm && (live.monitor_only || live.recording))) => {
+        TrackKind::Audio
+            if !live.input.is_empty()
+                && (t.mixer.input_monitor || (s.edit.auto_input_monitoring && t.mixer.record_arm && (live.monitor_only || live.recording))) =>
+        {
             monitor_input(t, strip, live, frames);
         }
         TrackKind::Audio if live.monitor_only => {}
-        TrackKind::Instrument | TrackKind::Midi if live.monitor_only => {}
+        // Recording, unmonitored: what it is replacing must not play under the new take.
+        TrackKind::Audio if live.recording && t.mixer.record_arm => {}
         TrackKind::Audio => render_audio_clips(s, t, strip, blk),
         TrackKind::Aux | TrackKind::Folder => read_aux_bus(t, strip, busses, frames),
-        TrackKind::Instrument | TrackKind::Midi => render_instrument(s, t, strip, blk, &transport),
+        TrackKind::Instrument | TrackKind::Midi => {
+            // A live keyboard plays the track that hears it, transport running or not; clips
+            // play only while it runs.
+            let target = crate::hears_live_midi(s, t);
+            if live.monitor_only && !target {
+                release_live(strip);
+            } else {
+                render_instrument(s, t, strip, blk, &transport, !live.monitor_only, target.then_some(live.midi));
+            }
+        }
         _ => {}
     }
     let trim = db_to_gain(t.mixer.trim_db) * if t.mixer.phase_invert { -1.0 } else { 1.0 };
@@ -425,7 +488,8 @@ pub(crate) fn process_strip(s: &Session, t: &Track, strip: &mut Strip, busses: &
     run_inserts(t, strip, blk, &transport);
     let soloed_out = any_solo && !t.mixer.solo && !t.mixer.solo_safe && !receives_solo(s, t);
     strip.muted = t.mixer.mute || soloed_out;
-    if t.mixer.sends.iter().flatten().any(|x| x.pre_fader) {
+    // The pre-fader copy feeds pre-fader sends and, with Pre-Fader Metering on, the meter.
+    if s.edit.pre_fader_metering || t.mixer.sends.iter().flatten().any(|x| x.pre_fader) {
         strip.pre.resize_with(strip.buf.len(), Vec::new);
         for (d, src) in strip.pre.iter_mut().zip(strip.buf.iter()) {
             d.clear();

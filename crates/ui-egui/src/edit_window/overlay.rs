@@ -83,6 +83,13 @@ pub(super) fn overlay(app: &mut SoundApp, ui: &mut Ui, tl: Rect, area: Rect) {
         layout.last_scroll = cur;
         layout.last_follow_to = follow_to;
         scroll_to = follow_to;
+    } else {
+        // Stopped: the playhead stays where the transport is, thinner, so where playback paused
+        // (and where a punch will start) stays in sight.
+        let x = x_of(s, tl, app.position());
+        if x >= tl.min.x && x <= tl.max.x {
+            painter.line_segment([pos2(x, area.min.y), pos2(x, area.max.y)], Stroke::new(1.0, t.playhead.gamma_multiply(0.75)));
+        }
     }
     // Ghost of a clip move.
     if let Some(Gesture::MoveClips { clips, delta, from_track, to_track, grab_at }) = &app.gesture

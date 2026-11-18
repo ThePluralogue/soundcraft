@@ -31,6 +31,8 @@ pub const UI_COMMANDS: &[(&str, &str, &str, Option<&str>)] = &[
     ("window.close", "Close Window", "Window > Close Window", Some("Cmd+W")),
     ("window.hide_floating", "Hide All Floating Windows", "Window > Hide All Floating Windows", Some("Cmd+Ctrl+W")),
     ("window.midi_editor", "MIDI Editor", "Window > MIDI Editor", None),
+    ("window.channel_editor", "Channel Editor", "", None),
+    ("window.mix_dock", "Mixer Under Timeline", "View > Mixer Under Timeline", Some("Alt+M")),
     ("window.universe", "Universe", "View > Other Displays > Universe", Some("Alt+7")),
     ("window.video", "Video", "Window > Video", Some("Cmd+9")),
     ("window.video_universe", "Video Universe", "Window > Video Universe", None),
@@ -430,6 +432,7 @@ fn checked_state(app: &SoundApp, path: &str, id: Option<&str>) -> bool {
     match id {
         Some("options.loop_playback") => e.loop_playback,
         Some("options.loop_record") => e.loop_record,
+        Some("options.auto_input_monitoring") => e.auto_input_monitoring,
         Some("options.quickpunch") => e.quickpunch,
         Some("options.pre_post_roll") => e.pre_post_roll,
         Some("options.link_timeline_edit") => e.link_timeline_edit,
@@ -448,6 +451,7 @@ fn checked_state(app: &SoundApp, path: &str, id: Option<&str>) -> bool {
         Some("window.track_list") => app.ui.show_tracks_list,
         Some("window.clip_list_view") | Some("window.clip_list") => app.ui.show_clip_list,
         Some("window.narrow_mix") => app.ui.narrow_mix,
+        Some("window.mix_dock") => app.ui.show_mix_dock,
         Some("window.renderer") => app.extra.show_renderer,
         Some("window.ui_customization") => app.extra.show_ui_customization,
         Some("window.config_auto_update") => app.extra.auto_update_config,
@@ -594,6 +598,9 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
     if let Some(v) = crate::extra_windows::run(app, id, p) {
         return Some(Ok(v));
     }
+    if id == "window.channel_editor" {
+        return Some(crate::mix_window::channel_editor_command(app, p));
+    }
     if id == "ui.audio_device" {
         return Some(crate::windows::audio_device_command(app, p));
     }
@@ -648,6 +655,15 @@ pub fn run_ui_command(app: &mut SoundApp, id: &str, p: &Value) -> Option<Result<
         }
         "window.about" => toggle(&mut app.ui.show_about),
         "window.midi_editor" => toggle(&mut app.ui.show_midi_editor),
+        "window.mix_dock" => {
+            // One mixer at a time: the docked one replaces the separate Mix window.
+            let v = toggle(&mut app.ui.show_mix_dock);
+            if app.ui.show_mix_dock {
+                app.ui.mix_separate = false;
+                app.ui.window = MainWindow::Edit;
+            }
+            v
+        }
         "window.midi_front" => {
             app.ui.show_midi_editor = true;
             json!({"value": true})

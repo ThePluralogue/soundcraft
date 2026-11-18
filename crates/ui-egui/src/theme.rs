@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Whether the Light palette is active. Dark is the default (the incumbent is dark-only).
 static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
 
+/// Whether the Studio palette (a blue-grey dark variant) is active instead of Dark.
+static STUDIO_THEME: AtomicBool = AtomicBool::new(false);
+
 /// Unit tests that change or read the process-wide palette must own it until their assertions
 /// finish. The lock is re-entrant per thread, so a test may hold it and still build apps
 /// (`SoundApp::new` takes it too) without deadlocking itself.
@@ -74,16 +77,19 @@ pub enum ThemeMode {
     Light,
     #[default]
     Dark,
+    /// A blue-grey dark palette with a darker arrange area and bright blue accents.
+    Studio,
 }
 
 impl ThemeMode {
-    pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::System];
+    pub const ALL: [Self; 4] = [Self::Dark, Self::Studio, Self::Light, Self::System];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::System => "System",
             Self::Light => "Light",
             Self::Dark => "Dark",
+            Self::Studio => "Studio",
         }
     }
 
@@ -93,6 +99,7 @@ impl ThemeMode {
             Self::System => "system",
             Self::Light => "light",
             Self::Dark => "dark",
+            Self::Studio => "studio",
         }
     }
 
@@ -383,8 +390,100 @@ impl Tokens {
         slot_mark: Color32::from_rgb(92, 95, 102),
     };
 
+    /// Blue-grey dark palette: slate panels, a darker arrange area, bright blue accent.
+    pub const STUDIO: Tokens = Tokens {
+        window_bg: Color32::from_rgb(38, 42, 49),
+        panel_bg: Color32::from_rgb(47, 52, 60),
+        panel_bg2: Color32::from_rgb(56, 62, 71),
+        toolbar_bg: Color32::from_rgb(42, 47, 55),
+        toolbar_group: Color32::from_rgb(33, 37, 44),
+        border: Color32::from_rgb(20, 23, 28),
+        border_light: Color32::from_rgb(78, 86, 98),
+        edge_light: Color32::from_rgba_premultiplied(24, 26, 30, 24),
+        text: Color32::from_rgb(222, 226, 232),
+        text_dim: Color32::from_rgb(152, 160, 172),
+        text_dark: Color32::from_rgb(16, 18, 22),
+        header_text: Color32::from_rgb(208, 214, 222),
+        counter_bg: Color32::from_rgb(18, 21, 26),
+        counter_text: Color32::from_rgb(120, 190, 255),
+        counter_label: Color32::from_rgb(170, 178, 190),
+        accent: Color32::from_rgb(58, 142, 230),
+        accent_dark: Color32::from_rgb(38, 102, 176),
+        mode_on: Color32::from_rgb(58, 142, 230),
+        mode_on_text: Color32::from_rgb(255, 255, 255),
+        mode_off_text: Color32::from_rgb(120, 170, 225),
+        button: Color32::from_rgb(66, 73, 84),
+        button_hi: Color32::from_rgb(84, 93, 106),
+        button_border: Color32::from_rgb(24, 27, 33),
+        name_field: Color32::from_rgb(214, 220, 228),
+        name_field_sel: Color32::from_rgb(232, 238, 246),
+        ruler_bg: Color32::from_rgb(60, 66, 76),
+        ruler_label_bg: Color32::from_rgb(60, 66, 76),
+        ruler_text: Color32::from_rgb(196, 204, 214),
+        ruler_tick: Color32::from_rgb(112, 122, 136),
+        tempo_ruler: Color32::from_rgb(64, 132, 112),
+        meter_ruler: Color32::from_rgb(60, 112, 168),
+        marker_ruler: Color32::from_rgb(52, 58, 67),
+        playlist_bg: Color32::from_rgb(30, 33, 39),
+        playlist_alt: Color32::from_rgb(34, 38, 44),
+        grid_line: Color32::from_rgb(44, 49, 57),
+        bar_line: Color32::from_rgb(62, 69, 80),
+        selection: Color32::from_rgba_premultiplied(36, 78, 130, 110),
+        playhead: Color32::from_rgb(240, 240, 240),
+        insertion: Color32::from_rgb(120, 190, 255),
+        solo: Color32::from_rgb(236, 196, 48),
+        mute: Color32::from_rgb(64, 150, 236),
+        rec: Color32::from_rgb(226, 54, 54),
+        input: Color32::from_rgb(232, 140, 40),
+        auto_read: Color32::from_rgb(96, 200, 110),
+        auto_write: Color32::from_rgb(226, 70, 60),
+        auto_touch: Color32::from_rgb(232, 170, 50),
+        auto_latch: Color32::from_rgb(160, 120, 220),
+        meter_green: Color32::from_rgb(70, 206, 96),
+        meter_yellow: Color32::from_rgb(236, 210, 60),
+        meter_red: Color32::from_rgb(236, 56, 46),
+        fader_track: Color32::from_rgb(18, 20, 24),
+        strip_bg: Color32::from_rgb(58, 64, 74),
+        strip_section: Color32::from_rgb(47, 52, 60),
+        slot_bg: Color32::from_rgb(36, 40, 47),
+        automation_line: Color32::from_rgb(250, 210, 80),
+        menu_bar: Color32::from_rgb(34, 38, 45),
+        group_border: Color32::from_rgb(18, 20, 25),
+        mode_off: Color32::from_rgb(40, 52, 68),
+        counter_off: Color32::from_rgb(36, 48, 62),
+        counter_border: Color32::from_rgb(70, 78, 90),
+        counter_rule: Color32::from_rgb(52, 58, 67),
+        tool_bracket_off: Color32::from_rgb(78, 86, 98),
+        row_selected: Color32::from_rgb(44, 88, 148),
+        visible_dot: Color32::from_rgb(206, 212, 220),
+        big_counter_bg: Color32::from_rgb(18, 21, 26),
+        header_selected: Color32::from_rgb(58, 76, 100),
+        strip_selected: Color32::from_rgb(62, 80, 104),
+        marker_text: Color32::from_rgb(240, 242, 246),
+        playlist_lane: Color32::from_rgb(28, 31, 37),
+        universe_bg: Color32::from_rgb(26, 29, 35),
+        universe_view: Color32::from_rgb(120, 190, 255),
+        meter_bg: Color32::from_rgb(14, 16, 20),
+        meter_clip_off: Color32::from_rgb(64, 26, 26),
+        knob_bg: Color32::from_rgb(34, 38, 45),
+        knob_ring: Color32::from_rgb(58, 142, 230),
+        knob_pointer: Color32::from_rgb(236, 240, 246),
+        section_label: Color32::from_rgb(178, 188, 200),
+        slot_well: Color32::from_rgb(44, 49, 57),
+        slot_empty: Color32::from_rgb(40, 45, 52),
+        slot_face: [Color32::from_rgb(78, 120, 176), Color32::from_rgb(58, 96, 148)],
+        slot_bypassed: [Color32::from_rgb(86, 92, 102), Color32::from_rgb(70, 76, 86)],
+        slot_mark: Color32::from_rgb(214, 222, 232),
+    };
+
     pub fn current() -> Tokens {
-        if is_light() { Self::LIGHT } else { Self::DARK }
+        if is_light() {
+            Self::LIGHT
+        } else if is_studio() {
+            Self::STUDIO
+        } else {
+            Self::DARK
+        }
     }
 }
 
@@ -393,12 +492,22 @@ pub fn is_light() -> bool {
     LIGHT_THEME.load(Ordering::Relaxed)
 }
 
+/// Whether the Studio palette replaces Dark.
+pub fn is_studio() -> bool {
+    STUDIO_THEME.load(Ordering::Relaxed)
+}
+
+/// Select the Studio palette for the dark branch; the caller re-applies the visuals.
+pub fn set_studio(on: bool) {
+    STUDIO_THEME.store(on, Ordering::Relaxed);
+}
+
 /// Resolve each frame from the integration's current OS appearance, or on Linux the desktop's own
 /// setting when egui reports none. Unknown uses Dark.
 pub fn wants_light(ctx: &egui::Context, mode: ThemeMode) -> bool {
     match mode {
         ThemeMode::Light => true,
-        ThemeMode::Dark => false,
+        ThemeMode::Dark | ThemeMode::Studio => false,
         ThemeMode::System => crate::appearance::resolve(ctx.system_theme(), || crate::appearance::desktop_theme(ctx)) == Some(egui::Theme::Light),
     }
 }
@@ -532,6 +641,20 @@ mod tests {
         }
         assert_eq!(ThemeMode::parse(" Light "), Some(ThemeMode::Light));
         assert_eq!(ThemeMode::parse("sepia"), None);
+    }
+
+    #[test]
+    fn studio_mode_selects_the_studio_palette() {
+        let _palette = lock_test_palette();
+        assert_eq!(ThemeMode::parse("studio"), Some(ThemeMode::Studio));
+        let ctx = egui::Context::default();
+        assert!(!wants_light(&ctx, ThemeMode::Studio));
+        set_studio(true);
+        apply(&ctx, false);
+        assert_eq!(Tokens::current().panel_bg, Tokens::STUDIO.panel_bg);
+        set_studio(false);
+        apply(&ctx, false);
+        assert_eq!(Tokens::current().panel_bg, Tokens::DARK.panel_bg);
     }
 
     #[test]

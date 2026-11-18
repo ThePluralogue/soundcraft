@@ -158,6 +158,32 @@ pub(crate) fn receives_solo(s: &Session, t: &Track) -> bool {
         .any(|o| o.mixer.solo && (o.mixer.output == Route::Bus(*b) || o.mixer.sends.iter().flatten().any(|sn| sn.target == Route::Bus(*b))))
 }
 
+/// The first device channel and format of a hardware output path: one from the session's I/O
+/// setup, or a plain "Out 3-4" / "Out 5" name. `None` for anything else.
+pub fn hardware_output(s: &Session, name: &str) -> Option<(usize, soundcraft_model::ChannelFormat)> {
+    use soundcraft_model::ChannelFormat;
+    if let Some(o) = s.outputs.iter().find(|o| o.name.eq_ignore_ascii_case(name)) {
+        return Some((usize::from(o.first_channel), o.format));
+    }
+    let rest = name.trim().strip_prefix("Out ").or_else(|| name.trim().strip_prefix("out "))?;
+    let mut parts = rest.split('-');
+    let first = parts.next()?.trim().parse::<usize>().ok()?.checked_sub(1)?;
+    match parts.next() {
+        None => Some((first, ChannelFormat::Mono)),
+        Some(last) => {
+            let last = last.trim().parse::<usize>().ok()?.checked_sub(1)?;
+            (last == first + 1).then_some((first, ChannelFormat::Stereo))
+        }
+    }
+}
+
+/// The two panners that balance a stereo channel into a stereo bus: centre keeps it hard left
+/// and right, turning right moves the left side over (and the other way round).
+pub(crate) fn balance(pan: f32) -> [f32; 2] {
+    let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+    [(-1.0 + 2.0 * p.max(0.0)).clamp(-1.0, 1.0), (1.0 + 2.0 * p.min(0.0)).clamp(-1.0, 1.0)]
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod processing_order_tests {

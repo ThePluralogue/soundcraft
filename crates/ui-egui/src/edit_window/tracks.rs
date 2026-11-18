@@ -219,6 +219,10 @@ pub(crate) fn track_context_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
         let selected = &app.engine.session().edit.selected_tracks;
         if selected.contains(&id) { selected.iter().map(|track| track.0).collect() } else { vec![tid] }
     };
+    if ui.button("Channel Editor...").on_hover_text("This channel's routing, sends and every insert's controls in one window").clicked() {
+        crate::mix_window::open_channel_editor(app, id);
+        ui.close();
+    }
     for (label, cmd) in items {
         if ui.button(label).clicked() {
             if cmd == "ui.rename_track" {

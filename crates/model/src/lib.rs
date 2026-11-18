@@ -20,11 +20,12 @@ pub use clip::{Clip, ClipContent, Fade, FadeShape};
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
 pub use markers::{Group, MarkerKind, MemoryLocation};
 pub use mixer::{
-    Bus, ChannelFormat, INSERT_SLOTS, Insert, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, Speaker, SurroundPan, fader_db_to_pos, fader_pos_to_db,
+    Bus, ChannelFormat, CueMix, INSERT_SLOTS, Insert, MAX_SCENES, MixScene, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, Speaker, SurroundPan,
+    fader_db_to_pos, fader_pos_to_db,
 };
 pub use session::{
-    AutoName, BitDepthSetting, EditMode, EditState, FEET_FRAMES_START, MAX_COMMENT_CHARS, MAX_NAME_CHARS, SESSION_EXTENSION, Session, SessionError,
-    Tool, TrackView, ZoomState, ZoomToggle, truncate_chars,
+    AutoName, BitDepthSetting, EditMode, EditState, FEET_FRAMES_START, Groove, MAX_COMMENT_CHARS, MAX_GROOVE_POINTS, MAX_NAME_CHARS,
+    SESSION_EXTENSION, Session, SessionError, Tool, TrackView, ZoomState, ZoomToggle, truncate_chars,
 };
 pub use source::{FileFormat, Source, SourceAudio, SourcePool, VideoSource};
 pub use track::{Playlist, TRACK_COLORS, Track, TrackHeight, TrackKind};

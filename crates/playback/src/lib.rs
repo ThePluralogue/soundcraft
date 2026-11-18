@@ -23,12 +23,14 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod devices;
+pub mod midi_in;
 pub mod record;
 
 pub use devices::AudioConfig;
+pub use midi_in::{MidiInputs, PlayedMidi};
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
-use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
+use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, output_channels};
 use soundcraft_model::{Session, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -128,6 +130,8 @@ enum Cmd {
     Locate(Samples),
     /// Tracks the latest session no longer has (worked out on the UI thread): their meters go.
     Forget(Vec<TrackId>),
+    /// Live keyboards: their messages, and where to send what was played while running.
+    Midi(Receiver<soundcraft_mix::LiveMidi>, SyncSender<PlayedMidi>, Arc<std::sync::atomic::AtomicU64>),
 }
 
 struct Shared {
@@ -162,6 +166,8 @@ pub struct Player {
     _stream: Option<cpal::Stream>,
     #[cfg(target_arch = "wasm32")]
     _stream: Option<cpal::Stream>,
+    /// The open output device, for an input on the same device (see [`Player::open_recorder`]).
+    output_device: Option<cpal::Device>,
     pub device_name: String,
     pub device_rate: u32,
     /// Output channels the device was opened with (0 for the silent clock).
@@ -170,6 +176,10 @@ pub struct Player {
     pub device_buffer: Option<u32>,
     /// True when no audio device could be opened (silent clock).
     pub silent: bool,
+    /// Open live keyboards (MIDI input devices).
+    midi: Mutex<MidiInputs>,
+    /// What the keyboards played while the transport ran, for the UI to record.
+    played: Mutex<Option<Receiver<PlayedMidi>>>,
 }
 
 impl Player {
@@ -201,6 +211,14 @@ impl Player {
         self.fault.trouble(stalled)
     }
 
+    /// Open the input `audio` chooses. When it names the device the output already has open,
+    /// the input opens on that same device: an ASIO driver loads once per process, so a fresh
+    /// device scan does not list it while the output holds it.
+    pub fn open_recorder(&self, audio: &AudioConfig) -> Result<record::Recorder, String> {
+        let same = self.output_device.clone().filter(|_| !self.silent && audio.input.as_deref() == Some(self.device_name.as_str()));
+        record::Recorder::open_on(audio, same)
+    }
+
     fn side(&self) -> std::sync::MutexGuard<'_, Side> {
         self.side.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -216,7 +234,7 @@ impl Player {
             meters: Mutex::new(MeterSnapshot::default()),
         });
         let want = session.sample_rate.hz();
-        let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
+        let want_ch = u16::try_from(soundcraft_mix::device_channels(&session)).unwrap_or(2);
         let side_rate = session.sample_rate.as_f64() as f32;
         let new_side = |garbage: Receiver<Vec<Box<dyn Plugin>>>| {
             let mut side = Side::new(side_rate, garbage);
@@ -268,11 +286,14 @@ impl Player {
                             tx,
                             side: new_side(grx),
                             _stream: Some(stream),
+                            output_device: Some(device.clone()),
                             device_name: name,
                             device_rate: rate,
                             device_channels: config.channels,
                             device_buffer: buffer,
                             silent: false,
+                            midi: Mutex::default(),
+                            played: Mutex::new(None),
                         }
                     }
                     None => {
@@ -345,11 +366,14 @@ impl Player {
             tx,
             side,
             _stream: None,
+            output_device: None,
             device_name: "No audio device (silent)".into(),
             device_rate: rate,
             device_channels: 0,
             device_buffer: None,
             silent: true,
+            midi: Mutex::default(),
+            played: Mutex::new(None),
         }
     }
 
@@ -368,12 +392,51 @@ impl Player {
             tx,
             side,
             _stream: None,
+            output_device: None,
             device_name: "No audio device".into(),
             device_rate: session.sample_rate.hz(),
             device_channels: 0,
             device_buffer: None,
             silent: true,
+            midi: Mutex::default(),
+            played: Mutex::new(None),
         }
+    }
+
+    /// The MIDI input devices on this computer.
+    pub fn available_midi_inputs() -> Vec<String> {
+        midi_in::available()
+    }
+
+    /// (Re)opens the live keyboards `enabled` accepts, closing those open before, and connects
+    /// them to the audio thread. Returns the devices that opened. UI thread.
+    pub fn open_midi_inputs(&self, enabled: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let mut held = self.midi.lock().unwrap_or_else(PoisonError::into_inner);
+        // Close first: a device usually opens in one place at a time.
+        *held = MidiInputs::default();
+        let (tx, rx) = sync_channel(midi_in::LIVE_QUEUE);
+        let (ptx, prx) = sync_channel(midi_in::PLAYED_QUEUE);
+        *held = midi_in::open(enabled, &tx);
+        *self.played.lock().unwrap_or_else(PoisonError::into_inner) = Some(prx);
+        let _ = self.tx.send(Cmd::Midi(rx, ptx, Arc::clone(&held.heard)));
+        held.names.clone()
+    }
+
+    /// `(received, heard)`: messages the open keyboards sent, and those the audio engine took.
+    pub fn midi_activity(&self) -> (u64, u64) {
+        self.midi.lock().unwrap_or_else(PoisonError::into_inner).activity()
+    }
+
+    /// The live keyboards open now, and those that would not open (with why).
+    pub fn midi_inputs(&self) -> (Vec<String>, Vec<String>) {
+        let m = self.midi.lock().unwrap_or_else(PoisonError::into_inner);
+        (m.names.clone(), m.failed.clone())
+    }
+
+    /// Takes what the keyboards played while the transport ran since the last call. UI thread.
+    pub fn take_played_midi(&self) -> Vec<PlayedMidi> {
+        let p = self.played.lock().unwrap_or_else(PoisonError::into_inner);
+        p.as_ref().map(|rx| rx.try_iter().take(midi_in::PLAYED_QUEUE).collect()).unwrap_or_default()
     }
 
     /// Sends a new session snapshot to the audio thread, with freshly created (state-restored,

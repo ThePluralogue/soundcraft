@@ -187,3 +187,47 @@ fn split_by_pitch() {
     assert_eq!(inside.iter().map(|n| n.pitch).collect::<Vec<_>>(), vec![60, 48]);
     assert_eq!(outside.iter().map(|n| n.pitch).collect::<Vec<_>>(), vec![36, 72]);
 }
+
+#[test]
+fn end_strength_moves_only_the_ends() {
+    let mut notes = vec![n(60, 250, 200)];
+    quantize(&mut notes, &QuantizeOptions { grid_ticks: 240, strength: 0.0, end_strength: 1.0, ..Default::default() });
+    assert_eq!((notes[0].start, notes[0].end()), (250, 480));
+}
+
+#[test]
+fn an_offset_quantizes_to_the_song_grid_not_the_clip() {
+    // The clip starts 100 ticks into the bar: tick 140 of the clip is tick 240 of the song.
+    let mut notes = vec![n(60, 130, 100)];
+    quantize(&mut notes, &QuantizeOptions { grid_ticks: 240, offset: 100, ..Default::default() });
+    assert_eq!(notes[0].start, 140);
+}
+
+#[test]
+fn groove_quantize_pulls_to_the_groove_and_its_velocity() {
+    // A one-beat groove with a late off-beat: 0 and 560 (a swung eighth), loud then soft.
+    let groove = [(0, 120), (560, 40)];
+    let mut notes = vec![n(60, 500, 100), n(60, 970, 100)];
+    let opts = QuantizeOptions { grid_ticks: 240, ..Default::default() };
+    quantize_to_groove(&mut notes, &groove, 960, &opts, 1.0);
+    assert_eq!((notes[0].start, notes[0].velocity), (560, 40));
+    assert_eq!((notes[1].start, notes[1].velocity), (960, 120));
+    let mut half = vec![n(60, 500, 100)];
+    quantize_to_groove(&mut half, &groove, 960, &QuantizeOptions { strength: 0.5, ..opts }, 0.5);
+    assert_eq!((half[0].start, half[0].velocity), (530, 70));
+    let mut none = vec![n(60, 500, 100)];
+    quantize_to_groove(&mut none, &[], 960, &opts, 1.0);
+    assert_eq!(none[0].start, 500);
+}
+
+#[test]
+fn humanize_stays_within_its_amounts() {
+    let mut notes: Vec<_> = (0..64).map(|i| n(60, 1000 + i * 240, 100)).collect();
+    let before = notes.clone();
+    humanize(&mut notes, 20, 10, 7);
+    assert!(notes.iter().zip(&before).any(|(a, b)| a.start != b.start), "something moved");
+    for (a, b) in notes.iter().zip(&before) {
+        assert!((a.start - b.start).abs() <= 20 && (i32::from(a.velocity) - i32::from(b.velocity)).abs() <= 10);
+        assert_eq!(a.length, b.length);
+    }
+}

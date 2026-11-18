@@ -89,6 +89,12 @@ pub struct UiState {
     pub show_audio_health: bool,
     pub show_about: bool,
     pub show_midi_editor: bool,
+    /// The mixer docked under the timeline in Edit.
+    pub show_mix_dock: bool,
+    /// Sections the docked mixer shows (same ids as `mix_views`); empty is the compact strip.
+    pub dock_mix_views: Vec<String>,
+    /// The docked mixer uses full-width strips instead of narrow ones.
+    pub dock_mix_wide: bool,
     pub show_universe: bool,
     pub narrow_mix: bool,
     /// Mix window sections: inserts_ae, inserts_fj, sends_ae, sends_fj, io, comments, eq_curve, color.
@@ -99,6 +105,28 @@ pub struct UiState {
     pub track_tint: f32,
     /// Open plugin windows (track, slot).
     pub plugin_windows: Vec<(TrackId, usize)>,
+    /// Tabbed Inserts windows: one per track, with the insert slot whose tab is showing.
+    pub chain_windows: Vec<(TrackId, usize)>,
+    /// Folder for FX Chain files; empty means "FX Chains" beside the session's folder.
+    pub fx_chain_dir: String,
+    /// Channels whose Expand panel is open.
+    pub expanded_strips: Vec<TrackId>,
+    /// Inserts whose controls show under their slot in the Expand panel.
+    pub inline_inserts: Vec<(TrackId, usize)>,
+    /// Channels with an open Channel Editor window.
+    pub channel_editors: Vec<TrackId>,
+    /// Fader Flip: the bus whose sends the console faders set (None: the channel levels).
+    pub fader_flip: Option<u64>,
+    /// Console meters show the RMS (average) level inside the peak bar.
+    pub meter_rms: bool,
+    /// Scene recall also restores inputs and outputs.
+    pub scene_routing: bool,
+    /// Name typed for the next saved FX Chain.
+    #[serde(skip)]
+    pub chain_name: String,
+    /// Name typed for the next stored scene.
+    #[serde(skip)]
+    pub scene_name: String,
     /// The send in the Send window (track, slot).
     #[serde(skip)]
     pub send_window: Option<(TrackId, usize)>,
@@ -170,12 +198,25 @@ impl Default for UiState {
             show_audio_health: false,
             show_about: false,
             show_midi_editor: false,
+            show_mix_dock: false,
+            dock_mix_views: Vec::new(),
+            dock_mix_wide: false,
             show_universe: false,
             narrow_mix: false,
             mix_views: vec!["inserts_ae".into(), "sends_ae".into(), "io".into(), "color".into()],
             edit_views: vec!["color".into()],
             track_tint: 0.5,
             plugin_windows: Vec::new(),
+            chain_windows: Vec::new(),
+            fx_chain_dir: String::new(),
+            scene_routing: false,
+            expanded_strips: Vec::new(),
+            fader_flip: None,
+            inline_inserts: Vec::new(),
+            channel_editors: Vec::new(),
+            meter_rms: false,
+            chain_name: String::new(),
+            scene_name: String::new(),
             send_window: None,
             audiosuite: None,
             status: String::new(),
@@ -238,6 +279,8 @@ pub fn fit_window_to_screen(ctx: &egui::Context) {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MeterDisplay {
     pub level: [f32; 2],
+    /// Smoothed RMS level (linear), for Peak + RMS meters.
+    pub rms: [f32; 2],
     pub hold: [f32; 2],
     pub hold_age: f32,
     pub clip: bool,
@@ -284,6 +327,14 @@ pub struct SoundApp {
     lost_shown: u64,
     /// Where the takes being recorded go, autosaved with the session so a crash can't lose them.
     take_plan: Option<soundcraft_engine::io::Recording>,
+    /// The keyboard pick the player's MIDI inputs were opened for (`None`: not yet opened).
+    midi_key: Option<Option<Vec<String>>>,
+    /// Keyboard activity last logged: (received, heard) — see `Player::midi_activity`.
+    midi_logged: (u64, u64),
+    /// What the keyboards played during the current record pass.
+    played_midi: Vec<soundcraft_playback::PlayedMidi>,
+    /// The current record pass records audio (not only keyboards).
+    record_audio: bool,
     pub ui: UiState,
     pub audio_health_report: Option<Result<Value, String>>,
     pub services: Services,

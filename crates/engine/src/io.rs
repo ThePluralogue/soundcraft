@@ -242,6 +242,22 @@ pub fn stored_path(stored: &str, session: &Path) -> std::result::Result<PathBuf,
     craft_docpath::resolve_absolute(stored, Some(&session)).map_err(|why| format!("not opened: {why}"))
 }
 
+/// Regular files directly in `dir` whose extension is `ext` (any case), inside the automation read
+/// root when there is one, at most `limit` of them. A missing or unreadable folder lists nothing.
+pub fn list_files(dir: impl AsRef<Path>, ext: &str, limit: usize) -> Vec<PathBuf> {
+    let dir = dir.as_ref();
+    if cfg!(target_arch = "wasm32") || crate::file_access::check_read(dir).is_err() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(OsStr::to_str).is_some_and(|x| x.eq_ignore_ascii_case(ext)) && p.is_file())
+        .take(limit)
+        .collect()
+}
+
 /// Create `dir` and its parents, inside the automation write root when there is one. The browser
 /// has no folders: there each file is delivered by its name ([`write_file`]) and this does nothing.
 pub(crate) fn make_dir(dir: impl AsRef<Path>) -> Result<()> {

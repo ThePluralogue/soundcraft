@@ -86,7 +86,7 @@ fn header_keys_freeze_silence_and_show_automation() {
     assert_eq!(h.state().ui.window, MainWindow::Mix);
 }
 
-/// From the Edit window's insert column, clicking a plugin opens it, Cmd-click bypasses it, right-click changes or
+/// From the Edit window's insert column, clicking a plugin opens its Inserts window, Cmd-click bypasses it, right-click changes or
 /// removes it through the menu and an empty slot adds a plugin.
 #[test]
 fn edit_window_insert_slots_open_change_and_add_plugins() {
@@ -94,12 +94,12 @@ fn edit_window_insert_slots_open_change_and_add_plugins() {
     let slot = |i: usize| pos2(row[0] + HEADER_W + 37.5, row[1] + 8.5 + i as f32 * 18.0);
 
     click(&mut h, slot(0));
-    assert!(h.state().ui.plugin_windows.contains(&(kick, 0)));
-    h.state_mut().ui.plugin_windows.clear();
+    assert!(h.state().ui.chain_windows.contains(&(kick, 0)));
+    h.state_mut().ui.chain_windows.clear();
 
     press(&mut h, slot(0), PointerButton::Primary, CMD);
     assert!(bypassed(&h, 0));
-    assert!(h.state().ui.plugin_windows.is_empty());
+    assert!(h.state().ui.chain_windows.is_empty());
 
     press(&mut h, slot(1), PointerButton::Secondary, Modifiers::NONE);
     let remove = h.get_by_label("no insert").rect().center();
@@ -118,6 +118,43 @@ fn edit_window_insert_slots_open_change_and_add_plugins() {
     assert_eq!(insert(&h, 2).as_deref(), Some(plugin.id));
 }
 
+/// Drag with the primary button from `from` to `to` in a few moves, holding `modifiers`.
+fn drag(h: &mut Harness<'_, SoundApp>, from: Pos2, to: Pos2, modifiers: Modifiers) {
+    let button = PointerButton::Primary;
+    h.state_mut().synthetic.extend([
+        Event::ModifiersChanged(modifiers),
+        Event::PointerMoved(from),
+        Event::PointerButton { pos: from, button, pressed: true, modifiers },
+    ]);
+    step(h);
+    for k in 1..=4 {
+        h.state_mut().synthetic.push(Event::PointerMoved(from + (to - from) * (k as f32 / 4.0)));
+        step(h);
+    }
+    h.state_mut().synthetic.push(Event::PointerButton { pos: to, button, pressed: false, modifiers });
+    step(h);
+    h.state_mut().synthetic.push(Event::ModifiersChanged(Modifiers::NONE));
+    for _ in 0..6 {
+        step(h);
+    }
+}
+
+/// Dragging an insert onto another slot moves it there; Alt while dropping copies it instead.
+#[test]
+fn dragging_an_insert_moves_it_and_alt_copies_it() {
+    let (mut h, _, row) = harness("Kick", "medium", "view.edit_inserts_ae");
+    let slot = |i: usize| pos2(row[0] + HEADER_W + 37.5, row[1] + 8.5 + i as f32 * 18.0);
+    let first = insert(&h, 0);
+    assert!(first.is_some() && insert(&h, 2).is_none());
+
+    drag(&mut h, slot(0), slot(2), Modifiers::NONE);
+    assert_eq!((insert(&h, 0), insert(&h, 2)), (None, first.clone()), "moved");
+    assert!(h.state().ui.chain_windows.is_empty(), "a drag does not open the plugin");
+
+    drag(&mut h, slot(2), slot(0), Modifiers::ALT);
+    assert_eq!((insert(&h, 0), insert(&h, 2)), (first.clone(), first), "copied");
+}
+
 /// Short tracks draw insert slots as squares that still open, bypass and open the add-plugin menu.
 #[test]
 fn short_tracks_show_insert_slots_as_squares() {
@@ -125,7 +162,7 @@ fn short_tracks_show_insert_slots_as_squares() {
     let square = |i: usize| pos2(row[0] + HEADER_W + 9.0 + i as f32 * 14.0, row[1] + 8.5);
 
     click(&mut h, square(1));
-    assert!(h.state().ui.plugin_windows.contains(&(kick, 1)));
+    assert!(h.state().ui.chain_windows.contains(&(kick, 1)));
 
     press(&mut h, square(0), PointerButton::Primary, CMD);
     assert!(bypassed(&h, 0));

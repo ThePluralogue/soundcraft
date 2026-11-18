@@ -1024,6 +1024,7 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
     if let Route::Hardware(name) = &r
         && create_bus
         && !name.to_ascii_lowercase().starts_with("in ")
+        && (input || soundcraft_mix::hardware_output(s, name).is_none())
     {
         let fmt = tracks
             .first()

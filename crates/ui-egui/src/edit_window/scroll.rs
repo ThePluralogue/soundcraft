@@ -22,8 +22,34 @@ pub(super) fn scroll_into_view(app: &mut SoundApp, id: TrackId, view_h: f32) {
     }
 }
 
+/// Wheel movement, in points, per track-height step with Alt held.
+const HEIGHT_STEP_PX: f32 = 40.0;
+
 pub(super) fn scroll_and_zoom(app: &mut SoundApp, ui: &Ui, area: Rect, tl: Rect) {
-    let (delta, zoom, pointer, scrolling) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos(), i.is_scrolling()));
+    let (delta, zoom, pointer, scrolling, alt_wheel) = ui.input(|i| {
+        // Alt + wheel, read from the wheel events themselves (their modifiers are what was held).
+        let alt_wheel: f32 = i
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::MouseWheel { unit, delta, modifiers, .. } if modifiers.alt => {
+                    let d = if delta.y != 0.0 { delta.y } else { delta.x };
+                    Some(match unit {
+                        egui::MouseWheelUnit::Point => d,
+                        egui::MouseWheelUnit::Line => d * HEIGHT_STEP_PX,
+                        egui::MouseWheelUnit::Page => d * HEIGHT_STEP_PX * 4.0,
+                    })
+                }
+                _ => None,
+            })
+            .sum();
+        (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos(), i.is_scrolling(), alt_wheel)
+    });
+    // Alt + wheel over the timeline: every track taller or shorter at once.
+    if alt_wheel != 0.0 && pointer.is_some_and(|p| area.contains(p)) {
+        resize_all_tracks(app, alt_wheel);
+        return;
+    }
     let mut swipe = if scrolling { app.edit_layout.swipe } else { egui::Vec2::ZERO };
     if swipe.max_elem() < 6.0 {
         swipe += delta.abs();
@@ -39,6 +65,25 @@ pub(super) fn scroll_and_zoom(app: &mut SoundApp, ui: &Ui, area: Rect, tl: Rect)
     }
     if !horizontal && delta.y != 0.0 {
         app.edit_layout.scroll_by(-delta.y, tl.height());
+    }
+}
+
+/// Turn accumulated Alt+wheel movement into whole height steps for every track the Edit window shows.
+fn resize_all_tracks(app: &mut SoundApp, d: f32) {
+    let carry = app.edit_layout.height_carry + d;
+    let steps = (carry / HEIGHT_STEP_PX).trunc();
+    app.edit_layout.height_carry = carry - steps * HEIGHT_STEP_PX;
+    if steps == 0.0 {
+        return;
+    }
+    let s = app.engine.session();
+    let ids: Vec<u64> = s.tracks.iter().filter(|t| in_edit_window(s, t)).map(|t| t.id.0).collect();
+    if ids.is_empty() {
+        return;
+    }
+    let cmd = if steps > 0.0 { "track.height_up" } else { "track.height_down" };
+    for _ in 0..(steps.abs().min(4.0) as u32) {
+        let _ = app.engine.execute(cmd, &json!({"tracks": ids}));
     }
 }
 

@@ -18,10 +18,12 @@ pub enum Panel {
     Midi,
     Memory,
     History,
+    /// The mixer strips docked under the timeline in Edit, so faders and clips show at once.
+    Mixer,
 }
 
 impl Panel {
-    pub const ALL: &[Self] = &[Self::Canvas, Self::Tracks, Self::Clips, Self::Midi, Self::Memory, Self::History];
+    pub const ALL: &[Self] = &[Self::Canvas, Self::Tracks, Self::Clips, Self::Midi, Self::Memory, Self::History, Self::Mixer];
     fn label(self) -> &'static str {
         match self {
             Self::Canvas => "Session",
@@ -30,6 +32,7 @@ impl Panel {
             Self::Midi => "MIDI Editor",
             Self::Memory => "Memory Locations",
             Self::History => "Undo History",
+            Self::Mixer => "Mixer",
         }
     }
 }
@@ -194,8 +197,8 @@ pub fn validate(workspace: &Workspace) -> Result<(), String> {
 /// [`validate`] plus the Mix window's rule: Clips and MIDI stay in Edit.
 pub fn validate_mix(workspace: &Workspace) -> Result<(), String> {
     validate(workspace)?;
-    if workspace.layout.contains(&Panel::Clips) || workspace.layout.contains(&Panel::Midi) {
-        return Err("Clips and MIDI panels belong to the Edit window".into());
+    if workspace.layout.contains(&Panel::Clips) || workspace.layout.contains(&Panel::Midi) || workspace.layout.contains(&Panel::Mixer) {
+        return Err("Clips, MIDI and docked Mixer panels belong to the Edit window".into());
     }
     Ok(())
 }
@@ -314,6 +317,7 @@ fn sync(workspace: &mut Workspace, app: &crate::SoundApp, edit: bool) -> Result<
     if edit {
         set_visible(workspace, Panel::Clips, app.ui.show_clip_list)?;
         set_visible(workspace, Panel::Midi, app.ui.show_midi_editor)?;
+        set_visible(workspace, Panel::Mixer, app.ui.show_mix_dock)?;
     }
     Ok(())
 }
@@ -325,6 +329,7 @@ fn publish_visibility(app: &mut crate::SoundApp, workspace: &Workspace, edit: bo
     if edit {
         app.ui.show_clip_list = workspace.layout.contains(&Panel::Clips);
         app.ui.show_midi_editor = workspace.layout.contains(&Panel::Midi);
+        app.ui.show_mix_dock = workspace.layout.contains(&Panel::Mixer);
     }
 }
 
@@ -501,6 +506,17 @@ pub fn show(app: &mut crate::SoundApp, ui: &mut egui::Ui, window: crate::MainWin
             }
             Panel::Memory => crate::panels::memory_locations(app, ui),
             Panel::History => crate::panels::undo_history(app, ui),
+            Panel::Mixer => {
+                ui.painter().rect_filled(ui.max_rect(), 0.0, t.window_bg);
+                mixer_dock_bar(app, ui);
+                // The docked mixer has its own sections and width; the Mix window's own choices
+                // are put back after drawing.
+                let views = std::mem::replace(&mut app.ui.mix_views, app.ui.dock_mix_views.clone());
+                let narrow = std::mem::replace(&mut app.ui.narrow_mix, !app.ui.dock_mix_wide);
+                minimum_body(ui, egui::vec2(300.0, 240.0), |ui| crate::mix_window::content(app, ui));
+                app.ui.mix_views = views;
+                app.ui.narrow_mix = narrow;
+            }
         },
     );
     let _ = sync(&mut workspace, app, edit);
@@ -511,6 +527,50 @@ pub fn show(app: &mut crate::SoundApp, ui: &mut egui::Ui, window: crate::MainWin
             app.ui.status = format!("Panel move was not applied: {error}");
         }
     }
+}
+
+/// The docked mixer's toggles: which strip sections show (inserts, sends, I/O) and strip width.
+fn mixer_dock_bar(app: &mut crate::SoundApp, ui: &mut egui::Ui) {
+    const SECTIONS: [(&str, &str, &str); 3] = [
+        ("Inserts", "inserts_ae", "Show each channel's insert effects (click a slot to add or open one)"),
+        ("Sends", "sends_ae", "Show each channel's sends"),
+        ("I/O", "io", "Show each channel's input and output"),
+    ];
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (label, id, tip) in SECTIONS {
+            let on = app.ui.dock_mix_views.iter().any(|v| v == id);
+            if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
+                if on {
+                    app.ui.dock_mix_views.retain(|v| v != id);
+                } else {
+                    app.ui.dock_mix_views.push(id.to_string());
+                }
+            }
+        }
+        ui.separator();
+        let wide = app.ui.dock_mix_wide;
+        if ui.selectable_label(wide, "Wide").on_hover_text("Full-width channel strips").clicked() {
+            app.ui.dock_mix_wide = !wide;
+        }
+        ui.separator();
+        let n = app.engine.session().scenes.len();
+        let label = if n == 0 { "Scenes v".to_string() } else { format!("Scenes ({n}) v") };
+        ui.menu_button(label, |ui| crate::panels::scenes_menu(app, ui)).response.on_hover_text("Store and recall the whole console");
+        let cues = crate::mix_window::cue_label(app);
+        ui.menu_button(cues, |ui| crate::mix_window::cue_menu(app, ui))
+            .response
+            .on_hover_text("Cue mixes: headphone or monitor mixes, each on its own output");
+        let flipped = app.ui.fader_flip.is_some();
+        let flip = crate::mix_window::flip_label(app);
+        let color = if flipped { crate::theme::Tokens::current().accent } else { ui.visuals().text_color() };
+        let r = ui.menu_button(egui::RichText::new(flip).color(color), |ui| crate::mix_window::flip_menu(app, ui));
+        r.response.on_hover_text("Fader Flip: the faders set every channel's send to one bus, for a headphone or effects mix");
+        let meters = crate::mix_window::meters_label(app);
+        ui.menu_button(meters, |ui| crate::mix_window::meters_menu(app, ui))
+            .response
+            .on_hover_text("Meter display: peak or peak + RMS, before or after the fader");
+    });
 }
 
 /// Docking may make a specialist view smaller than its fixed tool/ruler geometry. Keep that
@@ -537,6 +597,7 @@ fn panel_limits(panel: &Panel) -> PanelLimits {
         Panel::Midi => (egui::vec2(420.0, 260.0), 1_000_000.0),
         Panel::Memory => (egui::vec2(260.0, 160.0), 1_000_000.0),
         Panel::History => (egui::vec2(200.0, 160.0), 720.0),
+        Panel::Mixer => (egui::vec2(300.0, 200.0), 1_000_000.0),
     };
     PanelLimits { min, max: egui::vec2(max_width, 1_000_000.0) }
 }

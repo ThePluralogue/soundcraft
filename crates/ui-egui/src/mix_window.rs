@@ -11,11 +11,21 @@ use serde_json::json;
 use soundcraft_model::{ChannelFormat, Route, SurroundPan, Track, TrackId, TrackKind};
 use soundcraft_playback::MeterSnapshot;
 
+mod cue;
+mod expand;
+mod inline;
+mod meters;
 mod plugin_menu;
 mod routing;
 mod sends;
 mod slots;
 
+pub(crate) use cue::{cue_label, cue_menu};
+use expand::Flip;
+pub(crate) use expand::{flip_label, flip_menu};
+pub(crate) use inline::{channel_editor_command, channel_editors, open_channel_editor};
+use inline::{inline_controls, inline_open, inline_toggle};
+pub(crate) use meters::{insert_drag_and_drop, meters_label, meters_menu};
 pub use plugin_menu::{instrument_menu, plugin_info, plugin_menu};
 pub(crate) use routing::{input_name, route_name, route_popup};
 #[cfg(test)]
@@ -213,6 +223,9 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
     y = toggle_rows(app, ui, &cx, y);
     fader_and_meter(app, ui, &cx, y, snap);
     name_and_readout(app, ui, &cx);
+    if expand::expanded(app, id) {
+        expand::expand_panel(app, ui, track, h);
+    }
 }
 
 /// Input gain stage ahead of the inserts (the track's trim).
@@ -576,9 +589,32 @@ fn fader_and_meter(app: &mut SoundApp, ui: &mut Ui, cx: &StripCtx<'_>, y: f32, s
     let fh = (r.max.y - STRIP_FOOT_H - y).max(120.0);
     let wide_meter = (if track.kind == TrackKind::Master { app.engine.session().main_format() } else { track.format }).channels() > 2;
     let fr = Rect::from_min_size(pos2(x0, y), vec2(inner_w * if wide_meter { 0.45 } else { 0.6 }, fh));
-    if let Some(db) = fader(ui, fr, track.mixer.volume_db, ui.scope_id().with(("fader", id.0)), &format!("{} level", track.name)) {
-        app.gesture = Some(crate::Gesture::Fader { track: id, start_db: track.mixer.volume_db });
-        let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
+    match expand::flip_of(app, track) {
+        Flip::Off => {
+            if let Some(db) = fader(ui, fr, track.mixer.volume_db, ui.scope_id().with(("fader", id.0)), &format!("{} level", track.name)) {
+                app.gesture = Some(crate::Gesture::Fader { track: id, start_db: track.mixer.volume_db });
+                let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
+            }
+        }
+        Flip::Send(slot, bus) => {
+            // Flipped: this fader is the send to the flip bus, tinted so it reads as a send, not the channel level.
+            ui.painter().rect_filled(fr.expand(2.0), 3.0, t.accent.gamma_multiply(0.22));
+            let level = track.mixer.sends.get(slot).cloned().flatten().map_or(-144.0, |s| s.level_db);
+            let label = format!("{} send to {bus}", track.name);
+            if let Some(db) = fader(ui, fr, level, ui.scope_id().with(("flip-fader", id.0)), &label) {
+                app.gesture = Some(crate::Gesture::SendFader { track: id, slot });
+                let _ =
+                    app.engine.execute_merged("mix.send_level", &json!({"track": id.0, "slot": slot, "db": db}), &format!("send:{}:{slot}", id.0));
+            }
+        }
+        Flip::NoSend(bus) => {
+            let br = Rect::from_center_size(pos2(x0 + inner_w / 2.0, fr.center().y), vec2(inner_w - 4.0, 20.0));
+            let mut c = ui.new_child(egui::UiBuilder::new().id_salt(("flip-add", id.0)).max_rect(br));
+            if c.add_sized(br.size(), egui::Button::new("+ Send")).on_hover_text(format!("Add a send from {} to {bus}", track.name)).clicked() {
+                let _ = app.run("mix.send", json!({"track": id.0, "bus": bus}));
+            }
+            return;
+        }
     }
     let md = app.meters.get(&id).copied().unwrap_or_default();
     let slot = fader_slot(fr);
@@ -597,10 +633,19 @@ fn fader_and_meter(app: &mut SoundApp, ui: &mut Ui, cx: &StripCtx<'_>, y: f32, s
         multi_meter(ui, mr, &lv, &labels, md.clip);
     } else if chans >= 2 {
         let mw = mr.width() / 2.0 - 1.0;
-        meter(ui, Rect::from_min_size(mr.min, vec2(mw, mr.height())), md.level[0], md.hold[0], md.clip);
-        meter(ui, Rect::from_min_size(pos2(mr.min.x + mw + 2.0, mr.min.y), vec2(mw, mr.height())), md.level[1], md.hold[1], md.clip);
+        let (lr, rr) =
+            (Rect::from_min_size(mr.min, vec2(mw, mr.height())), Rect::from_min_size(pos2(mr.min.x + mw + 2.0, mr.min.y), vec2(mw, mr.height())));
+        meter(ui, lr, md.level[0], md.hold[0], md.clip);
+        meter(ui, rr, md.level[1], md.hold[1], md.clip);
+        if app.ui.meter_rms {
+            crate::widgets::meter_rms(ui, lr, md.rms[0]);
+            crate::widgets::meter_rms(ui, rr, md.rms[1]);
+        }
     } else {
         meter(ui, mr, md.level[0], md.hold[0], md.clip);
+        if app.ui.meter_rms {
+            crate::widgets::meter_rms(ui, mr, md.rms[0]);
+        }
     }
     if md.gr > 0.1 {
         ui.painter().text(pos2(mr.center().x, mr.min.y - 3.0), Align2::CENTER_BOTTOM, format!("-{:.0}", md.gr), regular(8.0), t.meter_yellow);
@@ -614,20 +659,45 @@ fn name_and_readout(app: &mut SoundApp, ui: &mut Ui, cx: &StripCtx<'_>) {
     // Volume readout and name.
     let vr = Rect::from_min_size(pos2(x0 + 4.0, r.max.y - STRIP_FOOT_H + 4.0), vec2(inner_w - 8.0, 15.0));
     inset(ui.painter(), vr, t.counter_bg);
-    let (_, entered) = editable_readout(
-        ui,
-        vr,
-        ui.scope_id().with(("volume-value", id.0)),
-        Readout {
-            name: &format!("{} volume", track.name),
-            display: &db_text(track.mixer.volume_db),
-            edit_initial: &format!("{:.1}", track.mixer.volume_db),
-            parse: parse_db,
-            reset: 0.0,
-        },
-    );
-    if let Some(db) = entered {
-        let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
+    let flip = expand::flip_of(app, track);
+    match &flip {
+        Flip::Send(slot, bus) => {
+            let level = track.mixer.sends.get(*slot).cloned().flatten().map_or(-144.0, |s| s.level_db);
+            let (_, entered) = editable_readout(
+                ui,
+                vr,
+                ui.scope_id().with(("flip-value", id.0)),
+                Readout {
+                    name: &format!("{} send to {bus}", track.name),
+                    display: &db_text(level),
+                    edit_initial: &format!("{level:.1}"),
+                    parse: parse_db,
+                    reset: 0.0,
+                },
+            );
+            if let Some(db) = entered {
+                let _ =
+                    app.engine.execute_merged("mix.send_level", &json!({"track": id.0, "slot": slot, "db": db}), &format!("send:{}:{slot}", id.0));
+            }
+        }
+        Flip::NoSend(_) => {}
+        Flip::Off => {
+            let (_, entered) = editable_readout(
+                ui,
+                vr,
+                ui.scope_id().with(("volume-value", id.0)),
+                Readout {
+                    name: &format!("{} volume", track.name),
+                    display: &db_text(track.mixer.volume_db),
+                    edit_initial: &format!("{:.1}", track.mixer.volume_db),
+                    parse: parse_db,
+                    reset: 0.0,
+                },
+            );
+            if let Some(db) = entered {
+                let _ = app.engine.execute_merged("mix.volume", &json!({"track": id.0, "db": db}), &format!("fader:{}", id.0));
+            }
+        }
     }
     let kind = match track.kind {
         TrackKind::Audio => "audio",
@@ -639,7 +709,22 @@ fn name_and_readout(app: &mut SoundApp, ui: &mut Ui, cx: &StripCtx<'_>) {
         TrackKind::Folder => "folder",
         TrackKind::Video => "video",
     };
-    ui.painter().text(pos2(vr.center().x, vr.max.y + 9.0), Align2::CENTER_CENTER, kind, regular(9.5), t.text_dim);
+    match &flip {
+        Flip::Send(_, bus) | Flip::NoSend(bus) => {
+            ui.painter().with_clip_rect(Rect::from_min_size(pos2(x0, vr.max.y + 2.0), vec2(inner_w - 12.0, 14.0))).text(
+                pos2(vr.center().x - 5.0, vr.max.y + 9.0),
+                Align2::CENTER_CENTER,
+                format!("→ {bus}"),
+                regular(9.5),
+                t.accent,
+            );
+        }
+        Flip::Off => {
+            let (kind, color) = if cue::is_cue_aux(app, track) { ("cue", t.accent) } else { (kind, t.text_dim) };
+            ui.painter().text(pos2(vr.center().x - 5.0, vr.max.y + 9.0), Align2::CENTER_CENTER, kind, regular(9.5), color);
+        }
+    }
+    expand::expand_toggle(app, ui, Rect::from_center_size(pos2(x0 + inner_w - 5.0, vr.max.y + 9.0), vec2(12.0, 12.0)), track);
     let nr = Rect::from_min_size(pos2(x0, r.max.y - 26.0), vec2(inner_w, 18.0));
     ui.painter().rect(
         nr,

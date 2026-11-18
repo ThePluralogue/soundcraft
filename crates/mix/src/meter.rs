@@ -7,6 +7,8 @@ use super::instances::PluginFailures;
 pub struct StripMeter {
     /// First two channels (mono strips repeat channel 0), for stereo meters.
     pub peak: [f32; 2],
+    /// RMS (average power) of the first two channels over the measured block, linear.
+    pub rms: [f32; 2],
     /// Every channel of the strip (or of the main mix).
     pub peaks: Vec<f32>,
     /// Gain reduction of the first dynamics insert, dB.
@@ -18,6 +20,7 @@ impl StripMeter {
     /// Copy another meter without reallocating once the channel count is stable.
     pub fn copy_from(&mut self, o: &StripMeter) {
         self.peak = o.peak;
+        self.rms = o.rms;
         self.peaks.clone_from(&o.peaks);
         self.gain_reduction_db = o.gain_reduction_db;
         self.plugin_failures = o.plugin_failures;
@@ -39,6 +42,9 @@ impl StripMeter {
                 *p = max_level(*p, q);
             }
         }
+        for (r, q) in self.rms.iter_mut().zip(o.rms) {
+            *r = max_level(*r, q);
+        }
         self.gain_reduction_db = max_level(self.gain_reduction_db, o.gain_reduction_db);
         self.plugin_failures = o.plugin_failures;
     }
@@ -47,6 +53,7 @@ impl StripMeter {
     /// count and the plugin failure record. Never allocates.
     pub fn reset_levels(&mut self) {
         self.peak = [0.0; 2];
+        self.rms = [0.0; 2];
         self.peaks.iter_mut().for_each(|p| *p = 0.0);
         self.gain_reduction_db = 0.0;
     }
@@ -60,6 +67,8 @@ impl StripMeter {
         }
         let last = self.peaks.len().saturating_sub(1);
         self.peak = [self.peaks.first().copied().unwrap_or(0.0), self.peaks.get(1.min(last)).copied().unwrap_or(0.0)];
+        let ch = |i: usize| bufs.get(i).and_then(|b| b.get(..frames)).unwrap_or(&[]);
+        self.rms = [rms(ch(0)), rms(ch(1.min(last)))];
         self.gain_reduction_db = gr;
     }
 }
@@ -72,6 +81,15 @@ fn max_level(a: f32, b: f32) -> f32 {
         (false, true) => b,
         (false, false) => 0.0,
     }
+}
+
+/// Root mean square of a block; 0 for an empty one and for non-finite samples.
+fn rms(x: &[f32]) -> f32 {
+    if x.is_empty() {
+        return 0.0;
+    }
+    let sum = x.iter().fold(0.0f64, |acc, v| if v.is_finite() { acc + f64::from(*v) * f64::from(*v) } else { acc });
+    (sum / x.len() as f64).sqrt() as f32
 }
 
 fn peak(x: &[f32]) -> f32 {

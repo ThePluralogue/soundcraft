@@ -1,9 +1,9 @@
 //! Event menu: time/tempo operations, MIDI operations, markers.
-use super::{CommandSpec, always, bad, clip_ids_param, f32_or, f64_or, has_selection, has_tracks, i64_or, position_param, range_param, str_param};
+use super::{CommandSpec, always, bad, clip_ids_param, f64_or, has_selection, has_tracks, i64_or, position_param, range_param, str_param};
 
 use crate::{Engine, Result, cmd};
 use serde_json::{Value, json};
-use soundcraft_midi::ops::{DurationOp, QuantizeOptions, VelocityOp};
+use soundcraft_midi::ops::{DurationOp, VelocityOp};
 use soundcraft_model::{ClipContent, MarkerKind};
 use soundcraft_time::TICKS_PER_QUARTER;
 
@@ -25,15 +25,6 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("event.tempo_constant", "Constant...", ["Event", "Tempo Operations"], None, "{bpm, start?, end?}", always, tempo_constant),
         cmd!("event.insert_time", "Insert Time...", ["Event", "Time Operations"], None, "{start?, length | end}", has_tracks, insert_time),
         cmd!("event.cut_time", "Cut Time...", ["Event", "Time Operations"], None, "{start?, end?}", has_tracks, cut_time),
-        cmd!(
-            "event.quantize",
-            "Quantize...",
-            ["Event", "MIDI Operations"],
-            Some("Alt+0"),
-            "{grid?: 1/16 | ticks, strength?: 100, swing?: 0, clips?}",
-            has_selection,
-            quantize
-        ),
         cmd!("event.transpose", "Transpose...", ["Event", "MIDI Operations"], Some("Alt+T"), "{semitones, clips?}", has_selection, |e, p| {
             let st = i64_or(p, "semitones", 0).clamp(-127, 127) as i32;
             midi_op(e, p, move |n| soundcraft_midi::ops::transpose(n, st))
@@ -231,34 +222,6 @@ fn midi_op(e: &mut Engine, p: &Value, f: impl Fn(&mut [soundcraft_midi::Note])) 
         }
     }
     Ok(json!({"notes": n}))
-}
-
-fn grid_ticks(p: &Value) -> i64 {
-    match p.get("grid") {
-        Some(Value::Number(n)) => n.as_i64().unwrap_or(240).clamp(1, TICKS_PER_QUARTER * 16),
-        Some(Value::String(s)) => match s.trim() {
-            "1/1" | "1" | "bar" => TICKS_PER_QUARTER * 4,
-            "1/2" => TICKS_PER_QUARTER * 2,
-            "1/4" => TICKS_PER_QUARTER,
-            "1/8" => TICKS_PER_QUARTER / 2,
-            "1/8t" => TICKS_PER_QUARTER / 3,
-            "1/16t" => TICKS_PER_QUARTER / 6,
-            "1/32" => TICKS_PER_QUARTER / 8,
-            "1/64" => TICKS_PER_QUARTER / 16,
-            _ => TICKS_PER_QUARTER / 4,
-        },
-        _ => TICKS_PER_QUARTER / 4,
-    }
-}
-
-fn quantize(e: &mut Engine, p: &Value) -> Result<Value> {
-    let opts = QuantizeOptions {
-        grid_ticks: grid_ticks(p),
-        strength: (f32_or(p, "strength", 100.0) / 100.0).clamp(0.0, 1.0),
-        swing: (f32_or(p, "swing", 0.0) / 100.0).clamp(0.0, 1.0),
-        ..QuantizeOptions::default()
-    };
-    midi_op(e, p, move |n| soundcraft_midi::ops::quantize(n, &opts))
 }
 
 fn velocity(e: &mut Engine, p: &Value) -> Result<Value> {

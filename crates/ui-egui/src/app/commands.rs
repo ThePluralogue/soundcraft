@@ -9,7 +9,10 @@ impl SoundApp {
         if let Some(r) = menus::run_ui_command(self, id, &params) {
             return r;
         }
-        if id.starts_with("session.save") || id.starts_with("file.bounce") || id == "track.save_preset" {
+        if id.starts_with("session.save")
+            || id.starts_with("file.bounce")
+            || matches!(id, "track.save_preset" | "mix.chain_save" | "mix.scene_store" | "mix.insert_copy")
+        {
             // Third-party plugins keep state the session can't see: store it first.
             self.capture_plugin_states();
         }

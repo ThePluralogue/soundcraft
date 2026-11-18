@@ -321,6 +321,22 @@ pub fn meter(ui: &Ui, r: Rect, level: f32, hold: f32, clip: bool) {
     }
 }
 
+/// The RMS (average) level drawn over a [`meter`] in `r`: a bright inner column, so the peak
+/// bar's edge shows the transients and the column shows how loud it sounds.
+pub fn meter_rms(ui: &Ui, r: Rect, rms: f32) {
+    let pos = level_pos(rms);
+    if pos <= 0.005 {
+        return;
+    }
+    let t = Tokens::current();
+    let bar = meter_bar(r);
+    let inset = (bar.width() * 0.28).floor().max(1.0);
+    let col = Rect::from_min_max(pos2(bar.min.x + inset, bar.max.y - bar.height() * pos), pos2(bar.max.x - inset, bar.max.y));
+    if col.width() >= 1.0 {
+        ui.painter().rect_filled(col, 0.0, t.text.gamma_multiply(0.7));
+    }
+}
+
 /// The dB scale of a [`meter`] drawn in `r`, its numbers ending at `x`.
 pub fn meter_scale(p: &Painter, r: Rect, x: f32) {
     let t = Tokens::current();

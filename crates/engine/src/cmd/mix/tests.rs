@@ -484,3 +484,23 @@ fn live_input_states_of_restored_tracks_start_disabled() {
     assert!(!mixer.record_arm && !mixer.input_monitor);
     assert!(e.session().track(b).unwrap().mixer.input_monitor);
 }
+
+#[test]
+fn a_hosted_plugin_starts_without_stored_parameters_and_a_built_in_with_all() {
+    use soundcraft_dsp::{Category, ParamInfo, PluginInfo, Taper, Unit};
+    // A hosted plugin that reports 0 as the default of its output level, as Dexed does.
+    static PARAMS: [ParamInfo; 1] =
+        [ParamInfo { id: "output", name: "Output", min: 0.0, max: 1.0, default: 0.0, unit: Unit::None, taper: Taper::Linear, choices: &[] }];
+    static HOSTED: PluginInfo = PluginInfo {
+        id: "vst3:00000000000000000000000000000001",
+        name: "Hosted",
+        short_name: "Hosted",
+        category: Category::Instrument,
+        params: &PARAMS,
+        is_instrument: true,
+        audiosuite: false,
+    };
+    assert!(new_insert(&HOSTED).params.is_empty(), "storing the reported default would silence it");
+    let built_in = soundcraft_dsp::plugins().iter().find(|p| !p.params.is_empty()).unwrap();
+    assert_eq!(new_insert(built_in).params.len(), built_in.params.len());
+}

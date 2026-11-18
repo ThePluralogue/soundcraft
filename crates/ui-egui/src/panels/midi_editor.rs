@@ -143,7 +143,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
         t.text_dim,
     );
     let grid_ticks = grid_ticks_of(app);
-    midi_toolbar(app, ui, header, cid, grid_ticks);
+    midi_toolbar(app, ui, header, cid);
     let s = app.engine.session_arc();
     let sr = s.sample_rate;
     let base_tick = s.tempo.samples_to_ticks(clip.start, sr);
@@ -217,9 +217,9 @@ fn grid_ticks_of(app: &SoundApp) -> i64 {
 }
 
 /// The header toolbar: whole-clip MIDI operations.
-fn midi_toolbar(app: &mut SoundApp, ui: &mut Ui, header: Rect, cid: ClipId, grid_ticks: i64) {
+fn midi_toolbar(app: &mut SoundApp, ui: &mut Ui, header: Rect, cid: ClipId) {
     // Header toolbar: whole-clip MIDI operations.
-    let bar = Rect::from_min_max(pos2(header.max.x - 330.0, header.min.y + 1.0), pos2(header.max.x - 6.0, header.max.y - 1.0));
+    let bar = Rect::from_min_max(pos2(header.max.x - 430.0, header.min.y + 1.0), pos2(header.max.x - 6.0, header.max.y - 1.0));
     let mut tb = ui.new_child(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)));
     tb.spacing_mut().item_spacing.x = 4.0;
     let mut op: Option<(&str, serde_json::Value)> = None;
@@ -232,8 +232,12 @@ fn midi_toolbar(app: &mut SoundApp, ui: &mut Ui, header: Rect, cid: ClipId, grid
     if tb.small_button("Vel +10").clicked() {
         op = Some(("event.change_velocity", json!({"add": 10})));
     }
-    if tb.small_button("Quantize").on_hover_text("Quantize to the grid").clicked() {
-        op = Some(("event.quantize", json!({"grid": grid_ticks, "strength": 100})));
+    let label = crate::panels::quantize_label(app);
+    tb.menu_button(label, |ui| crate::panels::quantize_panel(app, ui, cid))
+        .response
+        .on_hover_text("Quantize panel: grid or groove, swing, Start / End / Range, presets, Humanize, Restore Timing");
+    if tb.small_button("Quantize").on_hover_text("Quantize with the Quantize panel's settings").clicked() {
+        op = Some(("event.quantize", json!({})));
     }
     if let Some((id, mut p)) = op {
         p["clips"] = json!([cid.0]);

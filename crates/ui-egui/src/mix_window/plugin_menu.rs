@@ -37,6 +37,8 @@ pub fn plugin_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId, slot: usize, oc
     if let Some(plugin) = hosted_menus(ui, false) {
         pick_insert(app, ui, id, slot, &plugin);
     }
+    ui.separator();
+    ui.menu_button("FX Chains", |ui| crate::panels::chain_menu(app, ui, id));
 }
 
 /// The instrument picker of an instrument track: a search field that takes typing at once, then

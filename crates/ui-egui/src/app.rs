@@ -11,9 +11,11 @@ mod commands;
 mod control;
 mod files;
 mod input;
+mod midi_keys;
 mod playback;
 mod plugins;
 
+pub(crate) use midi_keys::{keyboard_enabled, picked_keyboards};
 #[cfg(test)]
 pub(crate) use playback::automation_step_due;
 #[cfg(test)]
@@ -41,6 +43,10 @@ impl SoundApp {
             recorder_failed: false,
             lost_shown: 0,
             take_plan: None,
+            midi_key: None,
+            midi_logged: (0, 0),
+            played_midi: Vec::new(),
+            record_audio: false,
             ui: UiState::default(),
             audio_health_report: None,
             services,
@@ -151,6 +157,11 @@ impl SoundApp {
                 ctx.request_repaint();
             }
         }
+        let studio = self.ui.theme == theme::ThemeMode::Studio;
+        if theme::is_studio() != studio {
+            theme::set_studio(studio);
+            self.theme_applied = None;
+        }
         let light = theme::wants_light(ctx, self.ui.theme);
         if self.theme_applied != Some(light) || theme::is_light() != light {
             theme::apply(ctx, light);
@@ -194,6 +205,9 @@ impl SoundApp {
         }
         self.watch_output();
         self.watch_input();
+        self.sync_midi_inputs();
+        self.collect_played_midi();
+        self.log_midi_activity();
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
         if self.engine.revision != self.last_rev {

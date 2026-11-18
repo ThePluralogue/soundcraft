@@ -1,7 +1,7 @@
 use super::{
     Arc, AtomicBool, BLOCK, BTreeMap, Cmd, HashMap, HashSet, MAX_CHANNELS, MeterSnapshot, MixEngine, OLD_SESSIONS, Ordering, OutputTrouble, Plugin,
     PluginEditor, PluginStateReader, PluginStates, PreparedInstance, Range, Receiver, Samples, Sender, Session, Shared, SyncSender, TrackId,
-    itu_stereo_fold, main_channels, record, sync_channel,
+    itu_stereo_fold, output_channels, record, sync_channel,
 };
 
 /// How the audio output is doing, for the UI.
@@ -80,6 +80,8 @@ pub(crate) struct AudioState {
     pub(crate) device_rate: f64,
     input: Option<Arc<record::InputRing>>,
     recording: bool,
+    /// Live keyboards' messages, and where those played while running go (see `midi_in`).
+    midi: Option<(Receiver<soundcraft_mix::LiveMidi>, SyncSender<crate::PlayedMidi>, Arc<std::sync::atomic::AtomicU64>)>,
     /// Retired plugin instances go back to the UI thread to be dropped there.
     garbage: Sender<Vec<Box<dyn Plugin>>>,
     old_sessions: Option<SyncSender<Arc<Session>>>,
@@ -106,7 +108,7 @@ impl AudioState {
         garbage: Sender<Vec<Box<dyn Plugin>>>,
     ) -> Self {
         let sr = session.sample_rate.as_f64() as f32;
-        let nch = main_channels(&session);
+        let nch = output_channels(&session);
         AudioState {
             garbage,
             old_sessions: None,
@@ -125,6 +127,7 @@ impl AudioState {
             device_rate,
             input: None,
             recording: false,
+            midi: None,
             unsent: MeterSnapshot::default(),
             forget_shared: Vec::new(),
         }
@@ -135,6 +138,7 @@ impl AudioState {
         while let Ok(c) = self.rx.try_recv() {
             match c {
                 Cmd::Input(r) => self.input = Some(r),
+                Cmd::Midi(rx, played, heard) => self.midi = Some((rx, played, heard)),
                 Cmd::Forget(gone) => {
                     self.unsent.forget(&gone);
                     if self.forget_shared.is_empty() {
@@ -152,8 +156,9 @@ impl AudioState {
                         let _ = self.garbage.send(old.drain_plugins());
                     }
                     self.mix.adopt(instances);
-                    // The main format changed (a document edit, not steady state): resize.
-                    let nch = main_channels(&s);
+                    // The main format or a hardware output changed (a document edit, not steady
+                    // state): resize.
+                    let nch = output_channels(&s);
                     if self.pending.len() != nch {
                         self.pending = vec![vec![0.0; BLOCK]; nch];
                         self.pending_len = 0;
@@ -241,7 +246,18 @@ impl AudioState {
         }
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
+        if let Some((rx, played, heard)) = &self.midi {
+            while self.mix.live_midi.len() < soundcraft_mix::LIVE_MIDI_CAP {
+                let Ok(ev) = rx.try_recv() else { break };
+                heard.fetch_add(1, Ordering::Relaxed);
+                self.mix.live_midi.push(ev);
+                if self.playing {
+                    let _ = played.try_send(crate::PlayedMidi { at: self.pos, msg: ev.msg, recording: self.recording });
+                }
+            }
+        }
         self.mix.render(&self.session, self.pos, n, &mut self.pending);
+        self.mix.live_midi.clear();
         self.send_garbage();
         self.pending_len = n;
         self.publish_meters();
@@ -276,8 +292,14 @@ impl AudioState {
     pub(crate) fn fill(&mut self, out: &mut [f32], channels: usize) {
         self.drain();
         let channels = channels.max(1);
-        let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
+        let auto = self.session.edit.auto_input_monitoring;
+        let monitoring = (self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || (auto && t.mixer.record_arm)))
+            || (self.midi.is_some() && soundcraft_mix::live_midi_wanted(&self.session));
         if !self.playing && !monitoring {
+            // Nothing hears the keyboards: what they sent now must not play later in a burst.
+            if let Some((rx, ..)) = &self.midi {
+                while rx.try_recv().is_ok() {}
+            }
             out.iter_mut().for_each(|x| *x = 0.0);
             self.unsent.silence();
             self.forget_meters();

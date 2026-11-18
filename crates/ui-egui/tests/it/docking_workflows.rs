@@ -243,7 +243,7 @@ fn malformed_dock_operations_name_the_field() {
     let mut h = harness(None, 1400.0, 1.0);
     for (params, error) in [
         (json!({"operation":"close"}), "panel is required"),
-        (json!({"operation":"close","panel":"mixer"}), "Unknown panel: mixer"),
+        (json!({"operation":"close","panel":"nowhere"}), "Unknown panel: nowhere"),
         (
             json!({"operation":"move","panel":"clips","target":"tracks","zone":"middle"}),
             "zone must be tab, center, left, right, top, bottom, above or below",

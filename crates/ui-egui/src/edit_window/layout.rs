@@ -64,6 +64,9 @@ pub struct EditLayout {
     /// The current swipe's movement per axis until either passes 6 points; it scrolls only along the larger.
     #[serde(skip)]
     pub(super) swipe: egui::Vec2,
+    /// Alt+wheel movement not yet turned into a track-height step.
+    #[serde(skip)]
+    pub(super) height_carry: f32,
 }
 
 impl EditLayout {

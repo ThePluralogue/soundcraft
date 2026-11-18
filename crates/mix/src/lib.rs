@@ -80,7 +80,8 @@ pub use offline::{
 };
 pub use pan::itu_stereo_fold;
 use pan::{PanSpec, apply_matrix, apply_matrix_span, build_matrix};
-use routing::{processing_order, structure_fingerprint};
+pub use routing::hardware_output;
+use routing::{balance, processing_order, structure_fingerprint};
 use strip::{
     Block, BusBuf, LiveInput, SlotCtx, Strip, apply_params, contain_failure, note_insert_latency, process_strip, strip_channels, strip_format,
 };
@@ -100,9 +101,67 @@ pub const MAIN_CHANNELS: usize = 2;
 /// Widest strip, bus or main mix (9.1.6 / 3rd-order Ambisonics). Wider formats are truncated.
 pub const MAX_CHANNELS: usize = 16;
 
+/// One message from a live keyboard (MIDI input): status and two data bytes, unused bytes 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LiveMidi {
+    pub msg: [u8; 3],
+}
+
+/// Most live keyboard messages one block takes; more wait for the next.
+pub const LIVE_MIDI_CAP: usize = 512;
+
+fn plays_instrument(t: &Track) -> bool {
+    matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) && !t.inactive
+}
+
+/// Does `t` hear live keyboards? An instrument or MIDI track that is record-enabled or input
+/// monitoring does. When none is, the first selected one does, so a keyboard plays the track you
+/// pick, as in Studio One.
+pub fn hears_live_midi(s: &Session, t: &Track) -> bool {
+    if !plays_instrument(t) {
+        return false;
+    }
+    if t.mixer.record_arm || t.mixer.input_monitor {
+        return true;
+    }
+    if s.tracks.iter().any(|x| plays_instrument(x) && (x.mixer.record_arm || x.mixer.input_monitor)) {
+        return false;
+    }
+    s.edit.selected_tracks.iter().filter_map(|id| s.track(*id)).find(|x| plays_instrument(x)).is_some_and(|x| x.id == t.id)
+}
+
+/// Does any track hear live keyboards (so the engine must run while the transport is stopped)?
+pub fn live_midi_wanted(s: &Session) -> bool {
+    s.tracks.iter().any(|t| hears_live_midi(s, t))
+}
+
+/// Most device output channels a session's hardware outputs can reach.
+pub const MAX_HW_CHANNELS: usize = 64;
+
 /// Number of channels of a session's main mix.
 pub fn main_channels(s: &Session) -> usize {
     s.main_format().channels().clamp(MAIN_CHANNELS, MAX_CHANNELS)
+}
+
+/// Channels a render must produce for the device: the main mix, and every hardware output a
+/// channel plays out of (a cue mix on Out 3-4 needs four).
+pub fn output_channels(s: &Session) -> usize {
+    let hw = s
+        .tracks
+        .iter()
+        .filter_map(|t| match &t.mixer.output {
+            Route::Hardware(h) => hardware_output(s, h).map(|(first, fmt)| first.saturating_add(fmt.channels())),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    main_channels(s).max(hw).min(MAX_HW_CHANNELS)
+}
+
+/// Device output channels playback asks for: enough for [`output_channels`], and at least eight
+/// so a cue mix added while playing has outputs to reach.
+pub fn device_channels(s: &Session) -> usize {
+    output_channels(s).max(8)
 }
 
 /// Renders sessions. Keep one per playback stream; plugin state persists across blocks.
@@ -113,6 +172,12 @@ pub struct MixEngine {
     busses: HashMap<BusId, BusBuf>,
     main: Vec<Vec<f32>>,
     main_fmt: ChannelFormat,
+    /// Hardware outputs past the main mix (a cue mix's aux played out of outputs 3-4), one buffer
+    /// per device channel. Summed onto the device output after the main mix.
+    hw: Vec<Vec<f32>>,
+    /// This block's messages from live keyboards: the host fills it before `render` and clears
+    /// it after (at most [`LIVE_MIDI_CAP`]).
+    pub live_midi: Vec<LiveMidi>,
     pub meters: HashMap<TrackId, StripMeter>,
     pub main_meter: StripMeter,
     pub pan_law: PanLaw,
@@ -164,6 +229,8 @@ impl MixEngine {
             busses: HashMap::new(),
             main: vec![vec![0.0; max_block]; MAIN_CHANNELS],
             main_fmt: ChannelFormat::Stereo,
+            hw: Vec::new(),
+            live_midi: Vec::with_capacity(LIVE_MIDI_CAP),
             meters: HashMap::new(),
             main_meter: StripMeter::default(),
             pan_law: PanLaw::Minus3,
@@ -256,6 +323,7 @@ impl MixEngine {
                 i.failed = false;
             }
             s.held.clear();
+            s.live_held.clear();
             s.chase = true;
             s.align.clear();
             s.align_pre.clear();
@@ -364,6 +432,15 @@ impl MixEngine {
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
+        // One buffer per device channel for hardware-routed strips. Allocates only when the device
+        // channel count changes.
+        let hw_ch = out.len().min(MAX_HW_CHANNELS);
+        if self.hw.len() != hw_ch || self.hw.first().is_some_and(|c| c.len() != self.max_block) {
+            self.hw = vec![vec![0.0; self.max_block]; hw_ch];
+        }
+        for c in &mut self.hw {
+            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+        }
         self.begin_block(s, pos, frames);
         let blk = Block { pos, frames, any_solo: s.tracks.iter().any(|t| t.mixer.solo && !t.inactive) };
         let order = std::mem::take(&mut self.order);
@@ -382,7 +459,7 @@ impl MixEngine {
             }
         }
         let busses = std::mem::take(&mut self.busses);
-        let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
+        let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, midi: &self.live_midi };
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
                 process_strip(s, t, st, &busses, &live_in, blk);
@@ -409,10 +486,13 @@ impl MixEngine {
                     i.plugin.all_notes_off();
                 }
                 st.held.clear();
+                st.live_held.clear();
                 st.chase = true;
             }
         }
-        self.last_end = pos.saturating_add(frames as i64);
+        // Stopped (monitoring only), the position does not move: the next block renders at the
+        // same place, which is no seek. Counting it as one silenced live keys every block.
+        self.last_end = if self.monitor_only { pos } else { pos.saturating_add(frames as i64) };
         self.ensure_synced(s);
         for b in self.busses.values_mut() {
             for c in b.buf.iter_mut() {
@@ -482,7 +562,7 @@ impl MixEngine {
         }
         for (i, st) in work.iter_mut() {
             if let Some(t) = s.tracks.get(*i) {
-                self.route_strip(t, st, pos, frames);
+                self.route_strip(s, t, st, pos, frames);
             }
         }
         for (i, st) in work.drain(..) {
@@ -502,13 +582,13 @@ impl MixEngine {
             if st.scratch.len() < self.max_block {
                 st.scratch.resize(self.max_block, 0.0);
             }
-            let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
+            let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, midi: &self.live_midi };
             process_strip(s, t, &mut st, &self.busses, &live_in, blk);
             let ch = st.buf.len();
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
             st.align.process(&mut st.buf, frames);
             st.out_extra.set(0, ch);
-            self.route_strip(t, &mut st, pos, frames);
+            self.route_strip(s, t, &mut st, pos, frames);
             self.strips.insert(t.id, st);
         }
     }
@@ -561,8 +641,9 @@ impl MixEngine {
         // Output: min(out.len(), main channels) channels; any further output channels are silent.
         for (c, o) in out.iter_mut().enumerate() {
             let src = self.main.get(c);
+            let hw = self.hw.get(c);
             for i in 0..frames {
-                let v = src.and_then(|m| m.get(i)).copied().unwrap_or(0.0);
+                let v = src.and_then(|m| m.get(i)).copied().unwrap_or(0.0) + hw.and_then(|m| m.get(i)).copied().unwrap_or(0.0);
                 if let Some(d) = o.get_mut(i) {
                     *d = if v.is_finite() { v } else { 0.0 };
                 }
@@ -596,9 +677,12 @@ impl MixEngine {
     }
 
     /// Send, meter and pan a processed strip into the busses / main mix.
-    fn route_strip(&mut self, t: &Track, strip: &mut Strip, pos: Samples, frames: usize) {
+    fn route_strip(&mut self, s: &Session, t: &Track, strip: &mut Strip, pos: Samples, frames: usize) {
+        let pre_meter = s.edit.pre_fader_metering;
         let m = self.meters.entry(t.id).or_default();
-        m.measure(&strip.buf, frames, strip.gr);
+        // Pre-fader metering reads the signal after the inserts, before the fader and mute.
+        let metered = if pre_meter && strip.pre.len() == strip.buf.len() { &strip.pre } else { &strip.buf };
+        m.measure(metered, frames, strip.gr);
         m.plugin_failures = strip.failures;
         let src_fmt = strip_format(t, strip.buf.len());
         let law = self.pan_law;
@@ -609,14 +693,26 @@ impl MixEngine {
             }
             let lvl = send_level(t, i, snd.level_db, pos);
             let gain = db_to_gain(lvl);
-            let src = if snd.pre_fader { &strip.pre } else { &strip.buf };
             let Route::Bus(b) = &snd.target else { continue };
+            let cue = s.bus(*b).and_then(|x| x.cue);
+            let follow = cue.is_some_and(|c| c.follow_main);
+            // A cue mix that follows the main mix hears the channel after its fader.
+            let src = if snd.pre_fader && !follow { &strip.pre } else { &strip.buf };
             let Some(dst) = self.busses.get_mut(b) else { continue };
             if gain <= 0.0 {
                 continue;
             }
-            // Mono sends use the send's own pan; stereo sends go straight to L/R.
-            let stereo = if src.len() == 1 { [snd.pan, 0.0] } else { [-1.0, 1.0] };
+            // Mono sends use the send's own pan; stereo sends go straight to L/R. A cue send
+            // follows the channel's pan, or balances a stereo channel with its own pan.
+            let stereo = if follow {
+                [pan_at(t, 0, pos), pan_at(t, 1, pos)]
+            } else if src.len() == 1 {
+                [snd.pan, 0.0]
+            } else if cue.is_some() {
+                balance(snd.pan)
+            } else {
+                [-1.0, 1.0]
+            };
             let surround = snd.surround.as_ref().or(if snd.follow_main_pan { t.mixer.surround.as_ref() } else { None });
             let m = build_matrix(src_fmt, src.len(), dst.fmt, dst.buf.len(), &PanSpec { stereo, surround }, law);
             apply_matrix(src, frames, &mut dst.buf, &m, gain);
@@ -635,13 +731,21 @@ impl MixEngine {
             }
             _ => &strip.buf,
         };
-        let (dst, dst_fmt) = match &t.mixer.output {
-            Route::Main => (&mut self.main, self.main_fmt),
+        let (dst, dst_fmt): (&mut [Vec<f32>], ChannelFormat) = match &t.mixer.output {
+            Route::Main => (self.main.as_mut_slice(), self.main_fmt),
             Route::Bus(b) => match self.busses.get_mut(b) {
-                Some(d) => (&mut d.buf, d.fmt),
+                Some(d) => (d.buf.as_mut_slice(), d.fmt),
                 None => return,
             },
-            _ => return,
+            Route::Hardware(h) => {
+                let Some((first, fmt)) = hardware_output(s, h) else { return };
+                let end = first.saturating_add(fmt.channels().clamp(1, MAX_CHANNELS)).min(self.hw.len());
+                match self.hw.get_mut(first..end) {
+                    Some(d) if !d.is_empty() => (d, fmt),
+                    _ => return,
+                }
+            }
+            Route::None => return,
         };
         let mut start = 0;
         while start < frames {

@@ -184,6 +184,24 @@ fn session_reset_does_not_apply_old_stop_edits_to_the_new_session() {
 }
 
 #[test]
+fn stopping_keeps_a_loop_range_and_moves_only_an_insertion_point() {
+    let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    app.engine.session_mut().edit.insertion_follows_playback = true;
+    let range = soundcraft_time::Range::new(48_000, 96_000);
+    app.engine.session_mut().edit.selection = range;
+    app.run("transport.play", json!({"from": 60_000})).unwrap();
+    app.handle_transport(0.25);
+    app.stop_play();
+    assert_eq!(app.engine.session().edit.selection, range, "the range is the loop and punch range");
+    app.engine.session_mut().edit.selection = soundcraft_time::Range::point(0);
+    app.run("transport.play", json!({"from": 60_000})).unwrap();
+    app.handle_transport(0.25);
+    app.stop_play();
+    let at = app.engine.session().edit.selection;
+    assert!(at.is_empty() && at.start == app.position(), "Play resumes where it stopped: {at:?}");
+}
+
+#[test]
 fn clear_all_clip_indicators_clears_every_meter() {
     let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
     let kick = app.engine.session().track_by_name("Kick").unwrap().id;

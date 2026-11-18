@@ -1041,6 +1041,29 @@ fn input_monitoring_replaces_clips() {
 }
 
 #[test]
+fn without_auto_input_monitoring_an_armed_track_plays_its_input_only_when_monitored() {
+    let (mut s, t) = session_with_dc(0.5, 4800);
+    let mut eng = MixEngine::new(48_000.0, 512);
+    eng.input = vec![vec![0.25; 512]];
+    eng.monitor_only = true;
+    let mut out = vec![vec![0.0; 512]; 2];
+    s.track_mut(t).unwrap().mixer.record_arm = true;
+    eng.render(&s, 0, 512, &mut out);
+    assert!(out[0][100] > 0.1, "auto input: arming monitors");
+    // The interface monitors directly: arming alone must not add a second, delayed copy.
+    s.edit.auto_input_monitoring = false;
+    eng.render(&s, 0, 512, &mut out);
+    assert!(out[0][100].abs() < 1e-6, "armed, not monitored: silence");
+    eng.monitor_only = false;
+    eng.recording = true;
+    eng.render(&s, 0, 512, &mut out);
+    assert!(out[0][100].abs() < 1e-6, "recording neither monitors nor plays the old take: {}", out[0][100]);
+    s.track_mut(t).unwrap().mixer.input_monitor = true;
+    eng.render(&s, 512, 512, &mut out);
+    assert!(out[0][100] > 0.1, "the track's own Input Monitoring still works");
+}
+
+#[test]
 fn empty_session_is_silent() {
     let s = Session::default();
     let out = render_range(&s, Range::new(0, 1000), 128);
@@ -1509,4 +1532,164 @@ fn consolidate_many_tiny_effect_clips_stays_fast() {
     assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
     assert!((out[0][1000] - 0.5 * db_to_gain(-6.0)).abs() < 1e-6);
     assert_eq!(out[0][1001], 0.0);
+}
+
+#[test]
+fn pre_fader_metering_reads_the_level_before_the_fader() {
+    let (mut s, t) = session_with_dc(0.5, 48_000);
+    s.track_mut(t).unwrap().mixer.volume_db = -80.0;
+    let mut eng = MixEngine::new(48_000.0, 512);
+    render_block(&mut eng, &s, 0);
+    assert!(eng.meters[&t].peak[0] < 0.01, "post-fader: {:?}", eng.meters[&t]);
+    s.edit.pre_fader_metering = true;
+    render_block(&mut eng, &s, 512);
+    assert!((eng.meters[&t].peak[0] - 0.5).abs() < 0.01, "pre-fader: {:?}", eng.meters[&t]);
+    s.track_mut(t).unwrap().mixer.mute = true;
+    render_block(&mut eng, &s, 1024);
+    assert!(eng.meters[&t].peak[0] > 0.4, "a muted channel still shows its input pre-fader");
+}
+
+#[test]
+fn meters_carry_rms_with_the_peak() {
+    let (s, t) = session_with_dc(0.5, 48_000);
+    let mut eng = MixEngine::new(48_000.0, 512);
+    render_block(&mut eng, &s, 0);
+    let m = &eng.meters[&t];
+    assert!((m.rms[0] - 0.5).abs() < 0.02 && m.rms[0] <= m.peak[0] + 1e-6, "{m:?}");
+}
+
+/// A DC track with a send to a cue mix played by an aux on Out 3-4, rendered to four device
+/// channels. Returns the last sample of each output channel.
+fn cue_render(follow_main: bool, volume_db: f32, pan: f32, send_pan: f32) -> Vec<f32> {
+    let (mut s, t) = session_with_dc(0.5, 48_000);
+    let bus = s.add_bus("Cue 1", ChannelFormat::Stereo);
+    s.busses[0].cue = Some(soundcraft_model::CueMix { follow_main });
+    let aux = s.add_track(TrackKind::Aux, ChannelFormat::Stereo, Some("Cue 1"));
+    let a = s.track_mut(aux).unwrap();
+    a.mixer.input = Route::Bus(bus);
+    a.mixer.output = Route::Hardware("Out 3-4".into());
+    let tr = s.track_mut(t).unwrap();
+    tr.mixer.volume_db = volume_db;
+    tr.mixer.pan = vec![pan];
+    let mut send = soundcraft_model::SendSlot::new(Route::Bus(bus));
+    send.level_db = 0.0;
+    send.pan = send_pan;
+    send.pre_fader = true;
+    tr.mixer.sends[0] = Some(send);
+    let mut eng = MixEngine::new(48_000.0, 512);
+    let mut out = vec![vec![0.0f32; 512]; 4];
+    eng.render(&s, 0, 512, &mut out);
+    eng.render(&s, 512, 512, &mut out);
+    out.iter().map(|c| c[500]).collect()
+}
+
+#[test]
+fn a_cue_mix_plays_out_of_its_own_hardware_output_before_the_fader() {
+    // The main fader is down, the cue send is pre-fader and panned hard left: only output 3 sounds.
+    let out = cue_render(false, -144.0, 0.0, -1.0);
+    assert!(out[0].abs() < 1e-4 && out[1].abs() < 1e-4, "main mix should be silent: {out:?}");
+    assert!(out[2] > 0.3, "the cue's left side should play on output 3: {out:?}");
+    assert!(out[3].abs() < 1e-4, "hard left leaves output 4 silent: {out:?}");
+}
+
+#[test]
+fn a_cue_mix_that_follows_the_main_mix_hears_the_fader_and_pan() {
+    // Following, the cue gets the channel after its fader and with its pan, so it matches the main mix.
+    let out = cue_render(true, -6.0, 1.0, -1.0);
+    assert!(out[1] > 0.1, "main mix right: {out:?}");
+    assert!((out[3] - out[1]).abs() < 1e-4, "the cue should match the main mix: {out:?}");
+    assert!(out[2].abs() < 1e-4 && out[0].abs() < 1e-4, "panned hard right: {out:?}");
+}
+
+#[test]
+fn hardware_output_names_resolve_to_device_channels() {
+    let mut s = Session::default();
+    assert_eq!(hardware_output(&s, "Out 3-4"), Some((2, ChannelFormat::Stereo)));
+    assert_eq!(hardware_output(&s, "Out 5"), Some((4, ChannelFormat::Mono)));
+    assert_eq!(hardware_output(&s, "Out 3-6"), None);
+    assert_eq!(hardware_output(&s, "Out 0"), None);
+    assert_eq!(hardware_output(&s, "Phones"), None);
+    s.outputs.push(soundcraft_model::OutputPath { name: "Phones".into(), first_channel: 6, format: ChannelFormat::Stereo });
+    assert_eq!(hardware_output(&s, "phones"), Some((6, ChannelFormat::Stereo)));
+    assert_eq!(balance(0.0), [-1.0, 1.0]);
+    assert_eq!(balance(1.0), [1.0, 1.0]);
+    assert_eq!(balance(-0.5), [-1.0, 0.0]);
+}
+
+#[test]
+fn a_channel_on_out_3_4_makes_the_render_four_channels_wide() {
+    let mut s = Session::default();
+    assert_eq!((output_channels(&s), device_channels(&s)), (2, 8));
+    let t = s.add_track(TrackKind::Aux, ChannelFormat::Stereo, Some("Cue 1"));
+    s.track_mut(t).unwrap().mixer.output = Route::Hardware("Out 3-4".into());
+    assert_eq!(output_channels(&s), 4);
+    s.track_mut(t).unwrap().mixer.output = Route::Hardware("Out 99-100".into());
+    assert_eq!(output_channels(&s), MAX_HW_CHANNELS, "capped");
+}
+
+/// Peak of `blocks` stopped (monitor-only) blocks, with `first` live messages in the first.
+fn live_blocks(eng: &mut MixEngine, s: &Session, first: &[[u8; 3]], blocks: usize) -> f32 {
+    let mut out = vec![vec![0.0f32; 512]; 2];
+    let mut peak = 0.0f32;
+    eng.live_midi.extend(first.iter().map(|m| LiveMidi { msg: *m }));
+    for _ in 0..blocks {
+        eng.render(s, 0, 512, &mut out);
+        eng.live_midi.clear();
+        peak = out.iter().flatten().fold(peak, |a, x| a.max(x.abs()));
+    }
+    peak
+}
+
+#[test]
+fn a_live_keyboard_plays_the_armed_instrument_while_the_transport_is_stopped() {
+    let mut s = synth_session(-6.0);
+    let t = s.tracks[0].id;
+    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.clear();
+    let mut eng = MixEngine::new(48_000.0, 512);
+    eng.monitor_only = true;
+    // Not armed, not selected: the keyboard plays nothing.
+    assert_eq!(live_blocks(&mut eng, &s, &[[0x90, 60, 110]], 10), 0.0);
+    s.track_mut(t).unwrap().mixer.record_arm = true;
+    assert!(live_blocks(&mut eng, &s, &[[0x90, 60, 110]], 10) > 0.01, "the armed track sounds");
+    // Disarmed while the key is down: the note is let go and the synth fades out.
+    s.track_mut(t).unwrap().mixer.record_arm = false;
+    live_blocks(&mut eng, &s, &[], 1);
+    s.track_mut(t).unwrap().mixer.record_arm = true;
+    let tail: Vec<f32> = (0..6).map(|_| live_blocks(&mut eng, &s, &[], 50)).collect();
+    assert!(tail.last().copied().unwrap_or(1.0) < 0.001, "no stuck note: {tail:?}");
+}
+
+#[test]
+fn a_held_live_key_keeps_sounding_while_the_transport_is_stopped() {
+    // Stopped, every block renders at the same position: that is not a seek, and must not
+    // silence the keys being held (they used to sound for one block: a click).
+    let mut s = synth_session(-6.0);
+    let t = s.tracks[0].id;
+    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.clear();
+    s.track_mut(t).unwrap().mixer.record_arm = true;
+    let mut eng = MixEngine::new(48_000.0, 512);
+    eng.monitor_only = true;
+    live_blocks(&mut eng, &s, &[[0x90, 60, 110]], 1);
+    live_blocks(&mut eng, &s, &[], 20);
+    let later = live_blocks(&mut eng, &s, &[], 1);
+    assert!(later > 0.01, "the key is still down 20 blocks later: {later}");
+    // Let go: it fades out.
+    live_blocks(&mut eng, &s, &[[0x80, 60, 0]], 1);
+    let tail: Vec<f32> = (0..6).map(|_| live_blocks(&mut eng, &s, &[], 50)).collect();
+    assert!(tail.last().copied().unwrap_or(1.0) < 0.001, "released: {tail:?}");
+}
+
+#[test]
+fn the_selected_instrument_hears_the_keyboard_until_one_is_armed() {
+    let mut s = Session::default();
+    let a = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("A"));
+    let b = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("B"));
+    let audio = s.add_track(TrackKind::Audio, ChannelFormat::Mono, Some("Vox"));
+    assert!(!live_midi_wanted(&s));
+    s.edit.selected_tracks = vec![audio, b];
+    let hears = |s: &Session, id| hears_live_midi(s, s.track(id).unwrap());
+    assert!(!hears(&s, a) && hears(&s, b) && !hears(&s, audio));
+    s.track_mut(a).unwrap().mixer.record_arm = true;
+    assert!(hears(&s, a) && !hears(&s, b), "an armed track takes the keyboard from the selection");
+    assert!(live_midi_wanted(&s));
 }

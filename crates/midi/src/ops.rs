@@ -40,6 +40,12 @@ pub struct QuantizeOptions {
     pub preserve_duration: bool,
     /// Random offset after quantizing, 0..=1 fraction of half a grid step.
     pub random: f32,
+    /// How far note ends move towards the grid, 0..=1, independently of the starts (0 = ends
+    /// stay put). `quantize_ends` overrides it with `strength`.
+    pub end_strength: f32,
+    /// Ticks from the start of the song grid to tick 0 of the notes (a clip that starts mid-bar),
+    /// so notes land on the song's grid lines rather than the clip's.
+    pub offset: i64,
 }
 
 impl Default for QuantizeOptions {
@@ -53,6 +59,8 @@ impl Default for QuantizeOptions {
             quantize_ends: false,
             preserve_duration: true,
             random: 0.0,
+            end_strength: 0.0,
+            offset: 0,
         }
     }
 }
@@ -85,19 +93,58 @@ pub fn quantize_with_seed(notes: &mut [Note], opts: &QuantizeOptions, seed: u64)
     if grid <= 0 {
         return;
     }
-    let strength = unit(opts.strength);
     let swing = unit(opts.swing);
+    quantize_to(notes, opts, seed, grid as f64 / 2.0, |t| Some((nearest_line(t, grid, swing), None)), 0.0);
+}
+
+/// Quantizes notes to a groove: `points` are (tick, velocity) positions inside one cycle of
+/// `length` ticks, repeated end to end from tick 0 of the song grid. `velocity` (0..=1) moves
+/// each note's velocity towards the groove's. Range is measured against half the average gap
+/// between groove points. Does nothing for an empty groove.
+pub fn quantize_to_groove(notes: &mut [Note], points: &[(i64, u8)], length: i64, opts: &QuantizeOptions, velocity: f32) {
+    if length <= 0 || points.is_empty() {
+        return;
+    }
+    let half = length as f64 / points.len() as f64 / 2.0;
+    quantize_to(notes, opts, DEFAULT_SEED, half, |t| nearest_groove(t, points, length).map(|(at, v)| (at, Some(v))), unit(velocity));
+}
+
+/// The groove point nearest to `t`, in the cycle before, at or after `t`'s.
+fn nearest_groove(t: i64, points: &[(i64, u8)], length: i64) -> Option<(i64, u8)> {
+    let k = t.div_euclid(length);
+    let mut best: Option<(i64, u8)> = None;
+    let mut best_d = u64::MAX;
+    for kk in [k.saturating_sub(1), k, k.saturating_add(1)] {
+        let base = kk.saturating_mul(length);
+        for &(at, v) in points {
+            let line = base.saturating_add(at.rem_euclid(length));
+            let d = line.abs_diff(t);
+            if d < best_d {
+                best_d = d;
+                best = Some((line, v));
+            }
+        }
+    }
+    best
+}
+
+/// The quantize pass shared by the grid and the groove: `target` gives the line nearest a tick
+/// (on the song grid) and, for a groove, its velocity. `half` is half a grid step, the unit of
+/// the range and random amounts.
+fn quantize_to(notes: &mut [Note], opts: &QuantizeOptions, seed: u64, half: f64, target: impl Fn(i64) -> Option<(i64, Option<u8>)>, vel: f64) {
+    let strength = unit(opts.strength);
     let include = unit(opts.include_within);
     let exclude = unit(opts.exclude_within);
     let random = unit(opts.random);
-    let half = grid as f64 / 2.0;
+    let end_strength = if opts.quantize_ends { strength } else { unit(opts.end_strength) };
+    let off = opts.offset;
     let mut rng = XorShift::new(seed);
 
     for n in notes.iter_mut() {
         let old_start = n.start;
         let old_end = n.end();
-        let target = nearest_line(old_start, grid, swing);
-        let d = target.saturating_sub(old_start);
+        let Some((line, groove_vel)) = target(old_start.saturating_add(off)) else { continue };
+        let d = line.saturating_sub(off).saturating_sub(old_start);
         let dist = d.unsigned_abs() as f64;
         if include < 1.0 && dist > include * half {
             continue;
@@ -110,9 +157,15 @@ pub fn quantize_with_seed(notes: &mut [Note], opts: &QuantizeOptions, seed: u64)
             new_start = new_start.saturating_add(round_i64(rng.next_signed() * random * half));
         }
         n.start = new_start;
-        n.length = if opts.quantize_ends {
-            let end_target = nearest_line(old_end, grid, swing);
-            let new_end = old_end.saturating_add(round_i64(end_target.saturating_sub(old_end) as f64 * strength));
+        n.length = if end_strength > 0.0 {
+            let line_at = |t: i64| target(t.saturating_add(off)).map(|(l, _)| l.saturating_sub(off));
+            // With the End amount, an end never lands on or before the start: then it goes to
+            // the next line. `quantize_ends` keeps the plain nearest line (a length of 1 at least).
+            let end_line = match line_at(old_end) {
+                Some(l) if l > new_start || opts.quantize_ends => l,
+                _ => line_at(new_start.saturating_add(round_i64(half * 2.0))).filter(|l| *l > new_start).unwrap_or(old_end),
+            };
+            let new_end = old_end.saturating_add(round_i64(end_line.saturating_sub(old_end) as f64 * end_strength));
             new_end.saturating_sub(new_start)
         } else if opts.preserve_duration {
             n.length
@@ -120,6 +173,28 @@ pub fn quantize_with_seed(notes: &mut [Note], opts: &QuantizeOptions, seed: u64)
             old_end.saturating_sub(new_start)
         }
         .max(1);
+        if let Some(v) = groove_vel
+            && vel > 0.0
+        {
+            let cur = f64::from(n.velocity);
+            n.velocity = round_i64(cur + (f64::from(v) - cur) * vel).clamp(1, 127) as u8;
+        }
+    }
+}
+
+/// Humanize: moves each note's start by up to `timing` ticks either way and its velocity by up
+/// to `velocity` either way (1..=127), at random. Lengths are kept and starts stay at or after 0.
+pub fn humanize(notes: &mut [Note], timing: i64, velocity: u8, seed: u64) {
+    let timing = timing.clamp(0, 1 << 20) as f64;
+    let mut rng = XorShift::new(seed);
+    for n in notes.iter_mut() {
+        if timing > 0.0 {
+            n.start = n.start.saturating_add(round_i64(rng.next_signed() * timing)).max(0);
+        }
+        if velocity > 0 {
+            let v = i64::from(n.velocity).saturating_add(round_i64(rng.next_signed() * f64::from(velocity)));
+            n.velocity = v.clamp(1, 127) as u8;
+        }
     }
 }
 

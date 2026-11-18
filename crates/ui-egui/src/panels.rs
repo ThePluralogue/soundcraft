@@ -7,6 +7,7 @@ use serde_json::json;
 use soundcraft_model::{ClipId, SourceId};
 
 mod about;
+mod chains;
 mod clips;
 mod history;
 mod memory;
@@ -15,15 +16,19 @@ mod tracks;
 mod transport;
 
 use about::{about, session_info};
+pub(crate) use chains::{chain_menu, scenes_menu};
 pub use clips::clip_list;
 pub(crate) use history::undo_history;
 pub(crate) use memory::memory_locations;
-use plugins::plugin_windows;
+pub(crate) use plugins::open_chain;
+use plugins::{chain_windows, plugin_windows};
 pub use tracks::tracks_and_groups;
 use transport::{big_counter, transport_window};
 
 pub mod extra_windows;
 pub mod midi_editor;
+mod quantize_panel;
+pub(crate) use quantize_panel::{quantize_label, quantize_panel};
 pub mod sampler_window;
 pub mod score_editor;
 pub mod video_window;
@@ -89,6 +94,8 @@ pub fn floating(app: &mut SoundApp, ctx: &egui::Context) {
     transport_window(app, ctx);
     big_counter(app, ctx);
     plugin_windows(app, ctx);
+    chain_windows(app, ctx);
+    crate::mix_window::channel_editors(app, ctx);
     crate::mix_window::send_window(app, ctx);
     about(app, ctx);
     session_info(app, ctx);
