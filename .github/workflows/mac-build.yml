@@ -14,7 +14,7 @@ permissions:
 jobs:
   macos:
     name: macOS universal (unsigned)
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 150
     env:
       CARGO_TERM_COLOR: always
