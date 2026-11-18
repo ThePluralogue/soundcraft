@@ -40,3 +40,10 @@ jobs:
           name: soundcraft-macos-universal
           path: dist/release/*
           if-no-files-found: error
+
+  # Diagnostic: shows whether this account gets any hosted runner at all.
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo "hosted runner acquired"
